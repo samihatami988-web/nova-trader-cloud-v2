@@ -11,6 +11,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
+RUN python final_v670.py
+
 EXPOSE 8000
 
-CMD ["sh", "-c", "python patch_v662.py && exec uvicorn app:app --host 0.0.0.0 --port 8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
