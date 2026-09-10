@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 5
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -18,6 +18,8 @@ services:
       - key: PUMPPORTAL_API_KEY
         sync: false
       - key: PUMPPORTAL_TRADE_STREAM_ENABLED
+        value: "true"
+      - key: NOVA_FREE_LITE
         value: "true"
 
 databases:

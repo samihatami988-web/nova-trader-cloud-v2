@@ -10,11 +10,12 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.6.0"
+APP_VERSION = "6.6.1"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 LIVE_EXECUTION_LOCKED = True
+FREE_LITE = os.getenv("NOVA_FREE_LITE","true").lower() in ("1","true","yes","on")
 
 PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY","").strip()
 PUMPPORTAL_TRADE_STREAM_ENABLED = os.getenv("PUMPPORTAL_TRADE_STREAM_ENABLED","false").lower() in ("1","true","yes","on")
@@ -234,7 +235,7 @@ DEFAULTS = {
     "max_data_age_sec": "90",
     "min_token_security_score": "60",
     "security_scan_ttl_sec": "600",
-    "security_scan_top_n": "5",
+    "security_scan_top_n": "2",
     "security_required_shadow": "true",
     "security_hard_block_shadow": "true",
     "min_route_quality": "55",
@@ -259,7 +260,7 @@ DEFAULTS = {
 
     "sniper_enabled": "true",
     "min_sniper_score": "78",
-    "sniper_scan_interval_sec": "8",
+    "sniper_scan_interval_sec": "20",
     "sniper_min_buy_pressure": "60",
     "sniper_min_volume_accel": "52",
     "sniper_min_m5_pct": "0.30",
@@ -283,8 +284,8 @@ DEFAULTS = {
     "realtime_exit_enabled": "true",
     "realtime_exit_min_interval_ms": "250",
     "realtime_exit_rest_fallback_ms": "750",
-    "pulse_max_trade_subscriptions": "120",
-    "pulse_subscription_ttl_sec": "120",
+    "pulse_max_trade_subscriptions": "12",
+    "pulse_subscription_ttl_sec": "30",
 
     "adaptive_pulse_enabled": "true",
     "pulse_diag_window_sec": "300",
@@ -334,8 +335,8 @@ DEFAULTS = {
 
     # V6.6 Launch Sniper — first-seconds PAPER engine.
     "launch_sniper_enabled": "true",
-    "launch_max_active_watch": "24",
-    "launch_watch_ttl_sec": "30",
+    "launch_max_active_watch": "8",
+    "launch_watch_ttl_sec": "15",
     "launch_entry_max_age_sec": "18",
     "launch_min_age_sec": "0.35",
     "launch_min_score": "74",
@@ -376,7 +377,7 @@ DEFAULTS = {
     "no_martingale": "true",
     "max_total_open_risk_pct": "3.0",
 
-    "position_watch_interval_sec": "4",
+    "position_watch_interval_sec": "8",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
     "readiness_min_pf": "1.15",
@@ -508,6 +509,12 @@ runtime = {
     "launch_best": None,
     "launch_last_event": 0,
     "launch_last_entry": None,
+
+    "free_lite": FREE_LITE,
+    "ws_events_dropped": 0,
+    "ws_eval_tasks_created": 0,
+    "runtime_cleanup_runs": 0,
+    "last_runtime_cleanup": 0,
 
     "engine_error_streak": 0,
     "last_decision_log": {},
@@ -3018,6 +3025,15 @@ def register_launch_token(data):
     now=time.time()
     launch_prune_histories()
 
+    # Free-Lite memory guard: stale launch objects must not accumulate while
+    # the mobile dashboard is closed.
+    for old_mint,old_info in list(runtime["launch_watch"].items()):
+        age=now-nz(old_info.get("created_t"))
+        if age>90 and old_mint not in runtime["realtime_exit_refs"]:
+            runtime["launch_watch"].pop(old_mint,None)
+            runtime["launch_marks"].pop(old_mint,None)
+            runtime["launch_confirmations"].pop(old_mint,None)
+
     creator=str(
         data.get("traderPublicKey") or data.get("creator") or
         data.get("txSigner") or data.get("user") or ""
@@ -3448,7 +3464,7 @@ def launch_status():
     rows=[]
     for mint,info in list(runtime["launch_watch"].items()):
         age=now-nz(info.get("created_t"))
-        if age>180 and not open_position_for_mint(mint):
+        if age>180 and mint not in runtime["realtime_exit_refs"]:
             runtime["launch_watch"].pop(mint,None)
             runtime["launch_marks"].pop(mint,None)
             continue
@@ -3666,7 +3682,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.6"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.6.1"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -3685,11 +3701,52 @@ async def realtime_exit_check(mint,m):
             {"mint":mint},dedupe_sec=120
         )
 
+
+def free_lite_runtime_cleanup():
+    """Bound in-memory realtime structures so a 512 MB instance stays stable."""
+    now=time.time()
+    if now-runtime.get("last_runtime_cleanup",0)<10:
+        return
+    runtime["last_runtime_cleanup"]=now
+    runtime["runtime_cleanup_runs"]+=1
+
+    subscribed=set(runtime.get("pulse_subscribed",set()))
+    open_refs=set(runtime.get("realtime_exit_refs",{}).keys())
+
+    for mint in list(runtime["pulse_buffers"].keys()):
+        if mint not in subscribed and mint not in open_refs:
+            runtime["pulse_buffers"].pop(mint,None)
+    for name in ("pulse_hot","pulse_recent_best"):
+        d=runtime.get(name,{})
+        for mint,v in list(d.items()):
+            if now-nz(v.get("seen_at"))>45 and mint not in open_refs:
+                d.pop(mint,None)
+
+    for mint,info in list(runtime["launch_watch"].items()):
+        if now-nz(info.get("created_t"))>90 and mint not in open_refs:
+            runtime["launch_watch"].pop(mint,None)
+            runtime["launch_marks"].pop(mint,None)
+            runtime["launch_confirmations"].pop(mint,None)
+
+    # Hard caps are a final safety net.
+    if len(runtime["pulse_buffers"])>64:
+        keep=set(list(runtime["pulse_subscribed"])[-32:]) | open_refs
+        for mint in list(runtime["pulse_buffers"].keys()):
+            if mint not in keep:
+                runtime["pulse_buffers"].pop(mint,None)
+    if len(runtime["pulse_hot"])>64:
+        ordered=sorted(runtime["pulse_hot"].items(),key=lambda kv:nz(kv[1].get("seen_at")),reverse=True)
+        runtime["pulse_hot"]=dict(ordered[:64])
+    if len(runtime["pulse_recent_best"])>64:
+        ordered=sorted(runtime["pulse_recent_best"].items(),key=lambda kv:nz(kv[1].get("seen_at")),reverse=True)
+        runtime["pulse_recent_best"]=dict(ordered[:64])
+
 async def sync_pulse_subscriptions(ws):
     """Prioritize open positions and prune stale metered trade subscriptions."""
     while True:
         try:
             now=time.time()
+            free_lite_runtime_cleanup()
             open_mints=set(open_spot_mints())
 
             missing=[m for m in open_mints if m not in runtime["pulse_subscribed"]]
@@ -3730,7 +3787,7 @@ async def sync_pulse_subscriptions(ws):
         except Exception as e:
             runtime["pulse_stream_error"]=f"subscription sync: {str(e)[:150]}"
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(3 if FREE_LITE else 1)
 
 
 def pulse_effective_thresholds():
@@ -4002,7 +4059,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.6"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.6.1"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -4097,10 +4154,11 @@ async def pumpportal_realtime_loop():
                 await ws.send(json.dumps({"method":"subscribeMigration"}))
 
                 now=time.time()
+                seed_cap=4 if FREE_LITE else 30
                 seeds=[
                     c.get("mint") for c in runtime.get("candidates",[])
                     if not c.get("perp_eligible") and c.get("mint")
-                ][:30]
+                ][:seed_cap]
                 seeds=list(dict.fromkeys(open_spot_mints()+seeds))
 
                 if seeds:
@@ -4134,7 +4192,7 @@ async def pumpportal_realtime_loop():
                         active=[
                             (m0,info) for m0,info in runtime["launch_watch"].items()
                             if time.time()-nz(info.get("created_t"))<=f("launch_watch_ttl_sec")
-                            and not open_position_for_mint(m0)
+                            and m0 not in runtime["realtime_exit_refs"]
                         ]
                         if len(active)>i("launch_max_active_watch"):
                             active.sort(key=lambda x:nz(x[1].get("created_t")))
@@ -4148,7 +4206,7 @@ async def pumpportal_realtime_loop():
                                         runtime["launch_watch"][em]["status"]="EXPIRED"
                                         runtime["launch_watch"][em]["last_reason"]="launch watch capacity"
 
-                        cap=max(30,i("pulse_max_trade_subscriptions"))
+                        cap=max(8,i("pulse_max_trade_subscriptions")) if FREE_LITE else max(30,i("pulse_max_trade_subscriptions"))
                         if mint not in runtime["pulse_subscribed"] and len(runtime["pulse_subscribed"])<cap:
                             await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":[mint]}))
                             runtime["pulse_subscribed"].add(mint)
@@ -4156,21 +4214,33 @@ async def pumpportal_realtime_loop():
 
                     lm=add_launch_trade(data)
                     if lm:
-                        asyncio.create_task(evaluate_launch_mint(mint,lm))
+                        # Only create an evaluation task when the first-seconds sample
+                        # has enough information to be remotely actionable.
+                        plausible=(
+                            int(lm.get("events_2s") or 0)>=2 and
+                            int(lm.get("unique_buyers_2s") or 0)>=1 and
+                            nz(lm.get("score"))>=55
+                        )
+                        if plausible and mint not in runtime["launch_evaluating"]:
+                            runtime["ws_eval_tasks_created"]+=1
+                            asyncio.create_task(evaluate_launch_mint(mint,lm))
 
+                    # In Free-Lite, avoid duplicating the full Pulse engine for every
+                    # launch trade. It still runs for open refs and stronger mature pulses.
                     m=add_pulse_event(data)
                     if not m:
                         continue
 
-                    # Open spot/launch positions are managed from each incoming trade event.
-                    if open_position_for_mint(mint):
+                    # No Postgres query per event: open refs are maintained in memory.
+                    if mint in runtime["realtime_exit_refs"]:
                         asyncio.create_task(realtime_exit_check(mint,m))
 
                     ok,_=pulse_gate_metrics(m)
-                    if ok:
+                    if ok and mint not in runtime["pulse_evaluating"]:
+                        runtime["ws_eval_tasks_created"]+=1
                         asyncio.create_task(evaluate_pulse_mint(mint,m))
 
-                    if len(runtime["pulse_subscribed"])>max(40,i("pulse_max_trade_subscriptions"))+20:
+                    if len(runtime["pulse_subscribed"])>(max(16,i("pulse_max_trade_subscriptions"))+8 if FREE_LITE else max(40,i("pulse_max_trade_subscriptions"))+20):
                         raise RuntimeError("subscription cap recycle")
 
         except Exception as e:
@@ -4191,7 +4261,7 @@ async def pumpportal_realtime_loop():
                 except BaseException:
                     pass
 
-            if len(runtime["pulse_subscribed"])>max(40,i("pulse_max_trade_subscriptions"))+20:
+            if len(runtime["pulse_subscribed"])>(max(16,i("pulse_max_trade_subscriptions"))+8 if FREE_LITE else max(40,i("pulse_max_trade_subscriptions"))+20):
                 runtime["pulse_subscribed"].clear()
                 runtime["pulse_subscription_birth"].clear()
 
@@ -4363,7 +4433,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.6.1"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -4425,7 +4495,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.6.1"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -4474,7 +4544,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.6.1"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -4555,16 +4625,24 @@ async def engine_loop():
                 runtime["last_error"]=str(e)
                 record_event("ERROR","ENGINE_LOOP_ERROR",str(e)[:220],
                              {"streak":runtime["engine_error_streak"]},dedupe_sec=180)
-            await asyncio.sleep(15)
+            await asyncio.sleep(30 if FREE_LITE else 15)
 
 @app.on_event("startup")
 async def startup():
     # V5.6.1 critical cadence migration: older DB values can survive deploys.
     # Only operational polling cadences are migrated; user risk/strategy settings are preserved.
-    if i("position_watch_interval_sec") != 4:
-        setv("position_watch_interval_sec","4")
-    if i("sniper_scan_interval_sec") != 8:
-        setv("sniper_scan_interval_sec","8")
+    desired_watch=8 if FREE_LITE else 4
+    desired_sniper=20 if FREE_LITE else 8
+    if i("position_watch_interval_sec") != desired_watch:
+        setv("position_watch_interval_sec",str(desired_watch))
+    if i("sniper_scan_interval_sec") != desired_sniper:
+        setv("sniper_scan_interval_sec",str(desired_sniper))
+    if FREE_LITE:
+        setv("pulse_max_trade_subscriptions","12")
+        setv("pulse_subscription_ttl_sec","30")
+        setv("launch_max_active_watch","8")
+        setv("launch_watch_ttl_sec","15")
+        setv("security_scan_top_n","2")
     if today_realized() < f("start_balance")*f("daily_profit_target_pct")/100:
         runtime["daily_target_locked"]=False
         runtime["daily_target_lock_time"]=None
@@ -4781,10 +4859,23 @@ def root():
 
 @app.get("/health")
 def health():
-    h=source_health()
-    return {"ok":h["status"]!="CRITICAL","version":APP_VERSION,"system":h,
-            "operating_mode":operating_mode(),"live_execution_locked":LIVE_EXECUTION_LOCKED,
-            "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"]}
+    # Render health checks must stay independent from external APIs/DB-heavy analytics.
+    age=None
+    if runtime.get("last_successful_loop"):
+        try:
+            age=(datetime.now(timezone.utc)-datetime.fromisoformat(runtime["last_successful_loop"])).total_seconds()
+        except Exception:
+            age=None
+    return {
+        "ok":True,
+        "version":APP_VERSION,
+        "free_lite":FREE_LITE,
+        "process":"UP",
+        "loop_alive":bool(runtime.get("loop_alive")),
+        "last_loop_age_sec":round(age,1) if age is not None else None,
+        "pulse_connected":bool(runtime.get("pulse_stream_connected")),
+        "live_execution_locked":LIVE_EXECUTION_LOCKED
+    }
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -4792,6 +4883,14 @@ def dashboard():
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
     return {
         "version":APP_VERSION,
+        "free_lite":{
+            "enabled":FREE_LITE,
+            "pulse_subscriptions":len(runtime.get("pulse_subscribed",set())),
+            "pulse_buffers":len(runtime.get("pulse_buffers",{})),
+            "launch_watch_objects":len(runtime.get("launch_watch",{})),
+            "eval_tasks_created":runtime.get("ws_eval_tasks_created",0),
+            "cleanup_runs":runtime.get("runtime_cleanup_runs",0)
+        },
         "mode":operating_mode(),
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
@@ -4989,7 +5088,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.6.1"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
