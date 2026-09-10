@@ -11,7 +11,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-RUN python final_v670.py
+RUN python final_v670.py && python hotfix_v671.py
 
 EXPOSE 8000
 
