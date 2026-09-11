@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -39,6 +39,22 @@ UNIVERSE_DEX_CHAINS = {x.strip().lower() for x in os.getenv(
 TRUSTED_PERP_SOURCES = {"VELOCITY", "BINANCE_FUTURES"}
 MAJOR_ASSETS = {"BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","LINK","SUI","TRX","TON","DOT","LTC","BCH","APT","NEAR","ATOM","UNI","AAVE"}
 MEME_ASSETS = {"DOGE","SHIB","PEPE","BONK","WIF","FLOKI","BOME","BRETT","MOG","TURBO","NEIRO","POPCAT","PNUT","MEME"}
+
+# V7.1 Multi-Timeframe Candle Intelligence.
+# This is an overlay on top of the profitable V7 flow/momentum engine; it does not replace
+# PumpPortal realtime logic or the existing liquidity/security/risk gates.
+CANDLE_ENGINE_ENABLED = os.getenv("NOVA_CANDLE_ENGINE_ENABLED", "true").lower() in ("1","true","yes","on")
+CANDLE_REFRESH_SEC = max(30, min(300, int(float(os.getenv("NOVA_CANDLE_REFRESH_SEC", "60")))))
+CANDLE_SCAN_CAP = max(3, min(24, int(float(os.getenv("NOVA_CANDLE_SCAN_CAP", "10")))))
+CANDLE_KLINE_LIMIT = max(210, min(500, int(float(os.getenv("NOVA_CANDLE_KLINE_LIMIT", "240")))))
+CANDLE_CONCURRENCY = max(2, min(10, int(float(os.getenv("NOVA_CANDLE_CONCURRENCY", "6")))))
+CANDLE_TIMEFRAMES = tuple(x.strip() for x in os.getenv("NOVA_CANDLE_TIMEFRAMES", "5m,15m,1h,4h").split(",") if x.strip())
+CANDLE_OVERLAY_WEIGHT = max(0.10, min(0.45, float(os.getenv("NOVA_CANDLE_OVERLAY_WEIGHT", "0.28"))))
+CANDLE_SPOT_OVERLAY_WEIGHT = max(0.08, min(0.35, float(os.getenv("NOVA_CANDLE_SPOT_OVERLAY_WEIGHT", "0.22"))))
+CANDLE_HARD_GATE = os.getenv("NOVA_CANDLE_HARD_GATE", "true").lower() in ("1","true","yes","on")
+CANDLE_GATE_MIN_CONFIDENCE = max(50.0, min(90.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_CONFIDENCE", "65"))))
+CANDLE_GATE_OPPOSITE_SCORE = max(65.0, min(95.0, float(os.getenv("NOVA_CANDLE_GATE_OPPOSITE_SCORE", "80"))))
+CANDLE_GATE_MIN_EDGE = max(10.0, min(35.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_EDGE", "20"))))
 
 PUMPPORTAL_API_KEY_RAW = os.getenv("PUMPPORTAL_API_KEY","")
 PUMPPORTAL_API_KEY = PUMPPORTAL_API_KEY_RAW.strip()
@@ -690,6 +706,12 @@ runtime.update({
     "binance_futures_exchange_ts": 0.0,
     "binance_spot_exchange_ts": 0.0,
     "universal_dex_assets": [],
+    "candle_intelligence": {},
+    "candle_last_refresh": None,
+    "candle_last_refresh_ts": 0.0,
+    "candle_refresh_count": 0,
+    "candle_errors": {},
+    "candle_targets": [],
 })
 
 position_manage_lock = asyncio.Lock()
@@ -1411,6 +1433,275 @@ async def _binance_exchange_info(client, futures=True):
         runtime["universe_provider_errors"][f"binance-{kind}-exchange"]=str(e)[:180]
         return cached
 
+
+
+def _ema_last(values, period):
+    vals=[nz(x) for x in values if x is not None]
+    if len(vals)<period or period<=1:return None
+    seed=sum(vals[:period])/period
+    alpha=2.0/(period+1.0)
+    ema=seed
+    for x in vals[period:]:ema=alpha*x+(1-alpha)*ema
+    return ema
+
+def _rsi_last(values, period=14):
+    vals=[nz(x) for x in values]
+    if len(vals)<period+1:return None
+    gains=[];losses=[]
+    for a,bp in zip(vals[:-1],vals[1:]):
+        d=bp-a;gains.append(max(0,d));losses.append(max(0,-d))
+    ag=sum(gains[:period])/period;al=sum(losses[:period])/period
+    for g,l in zip(gains[period:],losses[period:]):
+        ag=(ag*(period-1)+g)/period;al=(al*(period-1)+l)/period
+    if al<=1e-12:return 100.0 if ag>0 else 50.0
+    rs=ag/al
+    return 100-100/(1+rs)
+
+def _atr_pct(highs,lows,closes,period=14):
+    if len(closes)<period+1:return None
+    trs=[]
+    for idx in range(1,len(closes)):
+        trs.append(max(highs[idx]-lows[idx],abs(highs[idx]-closes[idx-1]),abs(lows[idx]-closes[idx-1])))
+    atr=sum(trs[-period:])/period
+    return atr/max(closes[-1],1e-12)*100
+
+def _vwap_last(highs,lows,closes,volumes,lookback=50):
+    n=min(len(closes),lookback)
+    if n<5:return None
+    num=0.0;den=0.0
+    for h,l,c,v in zip(highs[-n:],lows[-n:],closes[-n:],volumes[-n:]):
+        tp=(h+l+c)/3.0;num+=tp*v;den+=v
+    return num/den if den>0 else None
+
+def _candle_pattern(opens,highs,lows,closes):
+    if len(closes)<2:return "NONE"
+    o,c,h,l=opens[-1],closes[-1],highs[-1],lows[-1]
+    po,pc=opens[-2],closes[-2]
+    body=abs(c-o);rng=max(h-l,1e-12);upper=h-max(o,c);lower=min(o,c)-l
+    if c>o and pc<po and c>=po and o<=pc:return "BULL_ENGULFING"
+    if c<o and pc>po and c<=po and o>=pc:return "BEAR_ENGULFING"
+    if lower>body*2.2 and upper<body*.8 and body/rng<.45:return "HAMMER"
+    if upper>body*2.2 and lower<body*.8 and body/rng<.45:return "SHOOTING_STAR"
+    if body/rng<.08:return "DOJI"
+    return "BULL_BODY" if c>o else "BEAR_BODY" if c<o else "DOJI"
+
+def _tf_candle_features(rows,timeframe="?"):
+    """Convert Binance OHLCV rows into trader-style technical features."""
+    if not isinstance(rows,list) or len(rows)<55:return None
+    try:
+        opens=[float(x[1]) for x in rows];highs=[float(x[2]) for x in rows];lows=[float(x[3]) for x in rows]
+        closes=[float(x[4]) for x in rows];volumes=[float(x[5]) for x in rows]
+    except Exception:return None
+    close=closes[-1];ema20=_ema_last(closes,20);ema50=_ema_last(closes,50);ema200=_ema_last(closes,200)
+    rsi=_rsi_last(closes,14);atr=_atr_pct(highs,lows,closes,14);vwap=_vwap_last(highs,lows,closes,volumes,50)
+    vol_avg=sum(volumes[-21:-1])/20 if len(volumes)>=21 else (sum(volumes[:-1])/max(1,len(volumes)-1))
+    vol_ratio=volumes[-1]/max(vol_avg,1e-12)
+    # Market structure from two adjacent 10-candle windows.
+    rhi=max(highs[-10:]);rlo=min(lows[-10:]);phi=max(highs[-20:-10]);plo=min(lows[-20:-10])
+    if rhi>phi and rlo>plo:structure="HH_HL"
+    elif rhi<phi and rlo<plo:structure="LH_LL"
+    else:structure="RANGE"
+    prior_res=max(highs[-21:-1]);prior_sup=min(lows[-21:-1])
+    breakout=close>prior_res*1.0005;breakdown=close<prior_sup*.9995
+    # Retest approximation: price pierced prior S/R during current candle and closed back on the breakout side.
+    retest_long=(not breakout and close>prior_res and lows[-1]<=prior_res*1.002) or (breakout and lows[-1]<=prior_res*1.004)
+    retest_short=(not breakdown and close<prior_sup and highs[-1]>=prior_sup*.998) or (breakdown and highs[-1]>=prior_sup*.996)
+    pattern=_candle_pattern(opens,highs,lows,closes)
+
+    long_score=50.0;short_score=50.0
+    # EMA stack / trend.
+    if ema20 is not None and ema50 is not None:
+        if ema20>ema50:long_score+=9;short_score-=9
+        elif ema20<ema50:short_score+=9;long_score-=9
+    if ema200 is not None and ema50 is not None:
+        if ema50>ema200:long_score+=7;short_score-=7
+        elif ema50<ema200:short_score+=7;long_score-=7
+    if ema20 is not None:
+        if close>ema20:long_score+=4;short_score-=4
+        else:short_score+=4;long_score-=4
+    # VWAP position.
+    if vwap is not None:
+        if close>vwap:long_score+=6;short_score-=6
+        else:short_score+=6;long_score-=6
+    # RSI is used as trend confirmation, with exhaustion penalties at extremes.
+    if rsi is not None:
+        if 52<=rsi<=68:long_score+=8;short_score-=4
+        elif 32<=rsi<=48:short_score+=8;long_score-=4
+        elif rsi>=76:long_score-=7;short_score+=3
+        elif rsi<=24:short_score-=7;long_score+=3
+    if structure=="HH_HL":long_score+=10;short_score-=7
+    elif structure=="LH_LL":short_score+=10;long_score-=7
+    if breakout:long_score+=10;short_score-=6
+    if breakdown:short_score+=10;long_score-=6
+    if retest_long:long_score+=5
+    if retest_short:short_score+=5
+    if pattern in ("BULL_ENGULFING","HAMMER"):long_score+=6
+    elif pattern in ("BEAR_ENGULFING","SHOOTING_STAR"):short_score+=6
+    if vol_ratio>=1.35:
+        if closes[-1]>opens[-1]:long_score+=5
+        elif closes[-1]<opens[-1]:short_score+=5
+    # Extreme ATR reduces directional conviction instead of forcing a reversal.
+    if atr is not None and atr>6:
+        long_score-=4;short_score-=4
+
+    long_score=clamp(long_score,0,100);short_score=clamp(short_score,0,100)
+    edge=abs(long_score-short_score)
+    bias="BULLISH" if long_score-short_score>=8 else "BEARISH" if short_score-long_score>=8 else "NEUTRAL"
+    confidence=clamp(42+min(edge,30)*1.15+(8 if ema200 is not None else 0)+(5 if vol_ratio>=1.15 else 0),35,95)
+    return {
+        "timeframe":timeframe,"close":round(close,10),"ema20":None if ema20 is None else round(ema20,10),
+        "ema50":None if ema50 is None else round(ema50,10),"ema200":None if ema200 is None else round(ema200,10),
+        "rsi14":None if rsi is None else round(rsi,2),"atr_pct":None if atr is None else round(atr,3),
+        "vwap":None if vwap is None else round(vwap,10),"volume_ratio":round(vol_ratio,2),"structure":structure,
+        "support":round(prior_sup,10),"resistance":round(prior_res,10),"breakout":bool(breakout),"breakdown":bool(breakdown),
+        "retest_long":bool(retest_long),"retest_short":bool(retest_short),"pattern":pattern,"bias":bias,
+        "long_score":round(long_score,1),"short_score":round(short_score,1),"confidence":round(confidence,1),
+    }
+
+def _combine_candle_timeframes(tf_map):
+    weights={"5m":.15,"15m":.30,"1h":.35,"4h":.20}
+    valid={k:v for k,v in (tf_map or {}).items() if v}
+    if not valid:return None
+    den=sum(weights.get(k,.15) for k in valid)
+    long_score=sum(v["long_score"]*weights.get(k,.15) for k,v in valid.items())/max(den,1e-9)
+    short_score=sum(v["short_score"]*weights.get(k,.15) for k,v in valid.items())/max(den,1e-9)
+    confidence=sum(v["confidence"]*weights.get(k,.15) for k,v in valid.items())/max(den,1e-9)
+    side="BULLISH" if long_score-short_score>=7 else "BEARISH" if short_score-long_score>=7 else "NEUTRAL"
+    agree=sum(1 for v in valid.values() if v.get("bias")==side) if side!="NEUTRAL" else sum(1 for v in valid.values() if v.get("bias")=="NEUTRAL")
+    confidence=clamp(confidence*(.78+.22*agree/max(1,len(valid))),30,96)
+    anchor=valid.get("1h") or valid.get("15m") or next(iter(valid.values()))
+    return {
+        "bias":side,"long_score":round(long_score,1),"short_score":round(short_score,1),"confidence":round(confidence,1),
+        "agreement":f"{agree}/{len(valid)}","structure":anchor.get("structure"),"rsi14":anchor.get("rsi14"),
+        "atr_pct":anchor.get("atr_pct"),"pattern":anchor.get("pattern"),"timeframes":valid,
+    }
+
+async def _fetch_binance_klines(client,symbol,timeframe,futures=False):
+    base=BINANCE_FUTURES_BASE if futures else BINANCE_SPOT_BASE
+    path="/fapi/v1/klines" if futures else "/api/v3/klines"
+    r=await client.get(base+path,params={"symbol":symbol,"interval":timeframe,"limit":CANDLE_KLINE_LIMIT},timeout=15)
+    r.raise_for_status();body=r.json()
+    return body if isinstance(body,list) else []
+
+def _candle_target(c):
+    source=str(c.get("data_source") or "")
+    mint=str(c.get("mint") or "")
+    if source=="BINANCE_FUTURES" and mint.startswith("binancef:"):
+        return mint.split(":",1)[1],True
+    if source=="BINANCE_SPOT" and mint.startswith("binances:"):
+        return mint.split(":",1)[1],False
+    return None
+
+def _select_candle_targets(pairs):
+    candidates=[]
+    for c in pairs or []:
+        target=_candle_target(c)
+        if not target:continue
+        base=str(c.get("symbol") or "").upper();major=1 if base in MAJOR_ASSETS else 0
+        score=max(nz(c.get("long_score")),nz(c.get("short_score")),nz(c.get("pump_score")),nz(c.get("scalp_score")))
+        qv=nz(c.get("quote_volume_24h"))
+        candidates.append((major,score,qv,c,target))
+    candidates.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
+    selected=[];seen=set()
+    # Always prefer one futures/spot instrument per unique market id; majors naturally rank first.
+    for _,_,_,c,target in candidates:
+        key=(target[0],target[1])
+        if key in seen:continue
+        seen.add(key);selected.append((c,target))
+        if len(selected)>=CANDLE_SCAN_CAP:break
+    return selected
+
+async def refresh_candle_intelligence(client,pairs,force=False):
+    if not CANDLE_ENGINE_ENABLED:return
+    now=time.time()
+    if not force and now-nz(runtime.get("candle_last_refresh_ts"))<CANDLE_REFRESH_SEC:return
+    targets=_select_candle_targets(pairs)
+    runtime["candle_targets"]=[{"mint":c.get("mint"),"symbol":c.get("symbol"),"market":t[0],"futures":t[1]} for c,t in targets]
+    sem=asyncio.Semaphore(CANDLE_CONCURRENCY)
+    errors={}
+    async def one(c,target):
+        market,futures=target;tf_map={}
+        async def tf_job(tf):
+            try:
+                async with sem:
+                    rows=await _fetch_binance_klines(client,market,tf,futures)
+                return tf,_tf_candle_features(rows,tf),None
+            except Exception as e:return tf,None,str(e)[:160]
+        results=await asyncio.gather(*(tf_job(tf) for tf in CANDLE_TIMEFRAMES))
+        for tf,feat,err in results:
+            if feat:tf_map[tf]=feat
+            elif err:errors[f"{c.get('mint')}:{tf}"]=err
+        combined=_combine_candle_timeframes(tf_map)
+        if not combined:return c.get("mint"),None
+        combined.update({"mint":c.get("mint"),"symbol":c.get("symbol"),"market":market,
+                         "venue":"BINANCE_FUTURES" if futures else "BINANCE_SPOT",
+                         "asset_class":c.get("asset_class"),"updated_at":datetime.now(timezone.utc).isoformat()})
+        return c.get("mint"),combined
+    results=await asyncio.gather(*(one(c,t) for c,t in targets)) if targets else []
+    cache=dict(runtime.get("candle_intelligence") or {})
+    active=set()
+    for mint,intel in results:
+        if mint and intel:cache[mint]=intel;active.add(mint)
+    # Keep a small cache for temporary ranking changes but prune stale entries after 15 minutes.
+    cutoff=datetime.now(timezone.utc)-timedelta(minutes=15)
+    for k,v in list(cache.items()):
+        try:
+            ts=datetime.fromisoformat(str(v.get("updated_at")))
+            if ts.tzinfo is None:ts=ts.replace(tzinfo=timezone.utc)
+            if ts<cutoff:cache.pop(k,None)
+        except Exception:cache.pop(k,None)
+    runtime["candle_intelligence"]=cache;runtime["candle_errors"]=errors
+    runtime["candle_last_refresh_ts"]=now;runtime["candle_last_refresh"]=datetime.now(timezone.utc).isoformat()
+    runtime["candle_refresh_count"]=int(runtime.get("candle_refresh_count",0))+1
+
+def apply_candle_overlay(pairs):
+    if not CANDLE_ENGINE_ENABLED:return pairs
+    cache=runtime.get("candle_intelligence") or {}
+    for c in pairs or []:
+        intel=cache.get(c.get("mint"))
+        if not intel:continue
+        c["candle_intelligence"]=intel;c["candle_long_score"]=intel.get("long_score");c["candle_short_score"]=intel.get("short_score")
+        if c.get("perp_eligible"):
+            w=CANDLE_OVERLAY_WEIGHT
+            c["long_score"]=round((1-w)*nz(c.get("long_score"))+w*nz(intel.get("long_score")),1)
+            c["short_score"]=round((1-w)*nz(c.get("short_score"))+w*nz(intel.get("short_score")),1)
+            edge=abs(c["long_score"]-c["short_score"]);c["direction_edge"]=round(edge,1)
+            c["direction"]="WAIT" if edge<4 else ("LONG" if c["long_score"]>c["short_score"] else "SHORT")
+        elif str(c.get("data_source"))=="BINANCE_SPOT":
+            w=CANDLE_SPOT_OVERLAY_WEIGHT;cl=nz(intel.get("long_score"))
+            c["pump_score"]=round((1-w)*nz(c.get("pump_score"))+w*cl,1)
+            c["scalp_score"]=round((1-w)*nz(c.get("scalp_score"))+w*cl,1)
+            c["long_score"]=max(nz(c.get("long_score")),round((c["pump_score"]+c["scalp_score"])/2,1))
+            if intel.get("bias")=="BEARISH" and nz(intel.get("confidence"))>=75 and nz(intel.get("short_score"))-cl>=20:
+                c["direction"]="WAIT"
+    return pairs
+
+def candle_confirmation_gate(c,strategy):
+    if not (CANDLE_ENGINE_ENABLED and CANDLE_HARD_GATE):return True,"ok"
+    intel=c.get("candle_intelligence") or (runtime.get("candle_intelligence") or {}).get(c.get("mint"))
+    if not intel or nz(intel.get("confidence"))<CANDLE_GATE_MIN_CONFIDENCE:return True,"ok"
+    side=strategy_side(strategy)
+    own=nz(intel.get("long_score")) if side=="LONG" else nz(intel.get("short_score"))
+    opp=nz(intel.get("short_score")) if side=="LONG" else nz(intel.get("long_score"))
+    if opp>=CANDLE_GATE_OPPOSITE_SCORE and opp-own>=CANDLE_GATE_MIN_EDGE:
+        return False,"candle structure strongly contradicts entry"
+    return True,"ok"
+
+def candle_intelligence_status():
+    cache=list((runtime.get("candle_intelligence") or {}).values())
+    bullish=sum(1 for x in cache if x.get("bias")=="BULLISH");bearish=sum(1 for x in cache if x.get("bias")=="BEARISH")
+    neutral=sum(1 for x in cache if x.get("bias")=="NEUTRAL");majors=sum(1 for x in cache if str(x.get("symbol") or "").upper() in MAJOR_ASSETS)
+    top=sorted(cache,key=lambda x:(nz(x.get("confidence")),max(nz(x.get("long_score")),nz(x.get("short_score")))),reverse=True)[:10]
+    def small(x):
+        tf=x.get("timeframes") or {};t15=tf.get("15m") or {};t1=tf.get("1h") or {}
+        return {"symbol":x.get("symbol"),"market":x.get("market"),"venue":x.get("venue"),"asset_class":x.get("asset_class"),
+                "bias":x.get("bias"),"long_score":x.get("long_score"),"short_score":x.get("short_score"),"confidence":x.get("confidence"),
+                "agreement":x.get("agreement"),"structure":x.get("structure"),"rsi14":x.get("rsi14"),"atr_pct":x.get("atr_pct"),
+                "m15_rsi":t15.get("rsi14"),"h1_structure":t1.get("structure"),"h1_pattern":t1.get("pattern")}
+    return {"enabled":CANDLE_ENGINE_ENABLED,"hard_gate":CANDLE_HARD_GATE,"tracked":len(cache),"majors":majors,
+            "bullish":bullish,"bearish":bearish,"neutral":neutral,"timeframes":list(CANDLE_TIMEFRAMES),
+            "last_refresh":runtime.get("candle_last_refresh"),"refresh_count":runtime.get("candle_refresh_count",0),
+            "errors":len(runtime.get("candle_errors") or {}),"top":[small(x) for x in top]}
 
 def _binance_perp_candidate(info,ticker,premium):
     symbol=str(ticker.get("symbol") or "");base_asset=str(info.get("baseAsset") or symbol).upper();price=nz((premium or {}).get("markPrice"),nz(ticker.get("lastPrice")))
@@ -2884,6 +3175,11 @@ def gate(c,strategy=None):
 
     if strategy and strategy_side(strategy)=="SHORT" and not c.get("perp_eligible"):
         return False,"short unavailable for spot-only token"
+
+    if strategy:
+        cok,creason=candle_confirmation_gate(c,strategy)
+        if not cok:
+            return False,creason
 
     with SessionLocal() as s:
         if s.scalar(select(Position).where(Position.mint==c["mint"])):
@@ -5317,7 +5613,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.0.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.0"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5368,8 +5664,8 @@ def today_guard_status():
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA V7 universal engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.0.0"}) as client:
+    record_event("INFO","ENGINE_START","NOVA V7.1 universal + candle-intelligence engine loop started",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.0"}) as client:
         addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
@@ -5411,6 +5707,10 @@ async def engine_loop():
                 merged={c["mint"]:c for c in spot_pairs}
                 for c in velocity_pairs+binance_perps:merged[c["mint"]]=c
                 pairs=list(merged.values())
+                # V7.1: augment top CEX markets with multi-timeframe OHLCV intelligence.
+                # The overlay is deliberately weighted; existing flow/momentum signals remain primary.
+                await refresh_candle_intelligence(client,pairs)
+                apply_candle_overlay(pairs)
                 pairs.sort(key=lambda x:max(nz(x.get("pump_score")),nz(x.get("scalp_score")),nz(x.get("long_score")),nz(x.get("short_score"))),reverse=True)
 
                 if pairs:
@@ -5731,6 +6031,11 @@ def api_universe(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     return {"version":APP_VERSION,"live_execution_locked":LIVE_EXECUTION_LOCKED,"universe":universe_status()}
 
+@app.get("/api/candle-intelligence")
+def api_candle_intelligence(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
+    auth(x_nova_key)
+    return {"version":APP_VERSION,"live_execution_locked":LIVE_EXECUTION_LOCKED,"candle_intelligence":candle_intelligence_status()}
+
 @app.get("/api/dashboard")
 def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
@@ -5749,6 +6054,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         "mode":operating_mode(),
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "universe":universe_status(),
+        "candle_intelligence":candle_intelligence_status(),
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
         "engine_controls":engine_controls_status(),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,
