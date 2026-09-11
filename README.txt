@@ -1,42 +1,27 @@
-NOVA Trader V6.7.1 — Launch / Token-Trade Hotfix
-=================================================
+NOVA V6.7.3 COST OPTIMIZER
 
-WHY
----
-V6.7.0 successfully connected to PumpPortal (HTTP 101) and received new-token
-events, but create events were also being counted as Pulse events while actual
-Launch Sniper buy/sell trade events stayed at zero.
+Defaults:
+- 3 max paid token subscriptions
+- 12 second paid TTL
+- 12 new paid subscriptions/minute
+- 4000 BUY/SELL events/hour
+- wallet reserve floor 0.025 SOL
+- dynamic cap reduces to 2 then 1 as hourly budget fills
+- free NewToken/Migration streams stay online
+- LIVE execution remains locked
 
-WHAT V6.7.1 CHANGES
--------------------
-- Separates CREATE / BUY / SELL / MIGRATION / PROVIDER messages.
-- CREATE events are no longer treated as buy events.
-- Captures PumpPortal control/error messages that have no mint.
-- Gives fresh launches priority for subscribeTokenTrade slots.
-- Rotates old non-position subscriptions when the Free-Lite cap is full.
-- Tracks subscription requests/errors and last real trade event.
-- Keeps one WebSocket connection.
-- Keeps existing entry/risk/security/Edge Governor logic unchanged.
-- LIVE execution remains hard locked.
+Upload hotfix_v673.py and replace Dockerfile.
+Then New Build + Deploy in Northflank.
 
-UPLOAD
-------
-1) Add hotfix_v671.py to nova-trader-cloud-v2 root.
-2) Replace Dockerfile with this Dockerfile.
-3) Keep final_v670.py, app.py and requirements.txt.
-4) Trigger NEW BUILD + DEPLOY in Northflank (restart is not enough).
+Recommended Northflank env:
+PUMPPORTAL_PUBLIC_WALLET=<PUBLIC address only>
 
-EXPECTED
---------
-/health -> version 6.7.1
-/api/dashboard -> realtime_pulse.message_counts
-/api/diagnostics/pumpportal -> detailed safe trade-stream telemetry
-
-After 1-3 minutes of active Pump.fun traffic:
-- message_counts.create should rise
-- message_counts.buy / sell should rise if metered token subscriptions are accepted
-- launch_sniper.trades_seen should rise
-- Pulse events_total should represent real buy/sell prints, not token creates
-
-If create rises but buy/sell remains 0:
-check last_provider_message / trade_subscription_errors.
+Optional:
+NOVA_METERED_COST_OPTIMIZER=true
+NOVA_METERED_MAX_ACTIVE_SUBS=3
+NOVA_METERED_MAX_NEW_SUBS_PER_MIN=12
+NOVA_METERED_TOKEN_TTL_SEC=12
+NOVA_METERED_MAX_EVENTS_PER_HOUR=4000
+NOVA_METERED_WALLET_FLOOR_SOL=0.025
+NOVA_METERED_WALLET_CHECK_SEC=60
+NOVA_METERED_EST_SOL_PER_10K=0.01
