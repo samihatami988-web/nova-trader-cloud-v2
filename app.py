@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.8.1"
+APP_VERSION = "6.8.2"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -311,6 +311,14 @@ DEFAULTS = {
     "max_spot_position_liquidity_pct": "0.75",
     "max_spot_abs_m5_pct": "25",
 
+    # Manual engine controls. OFF blocks new entries only; existing positions
+    # remain under exit/risk management.
+    "scalp_engine_enabled": "true",
+    "pump_engine_enabled": "true",
+    "perp_long_engine_enabled": "true",
+    "perp_short_engine_enabled": "true",
+    "paid_trade_stream_enabled": "true",
+
     "sniper_enabled": "true",
     "min_sniper_score": "78",
     "sniper_scan_interval_sec": "20",
@@ -472,6 +480,34 @@ def setv(key, value):
 def f(key): return float(getv(key, DEFAULTS.get(key, "0")))
 def i(key): return int(float(getv(key, DEFAULTS.get(key, "0"))))
 def b(key): return getv(key, "false").lower() == "true"
+
+def strategy_manual_enabled(strategy):
+    mapping={
+        "SCALP_LONG":"scalp_engine_enabled",
+        "PUMP_LONG":"pump_engine_enabled",
+        "SNIPER_LONG":"sniper_enabled",
+        "LAUNCH_SNIPER":"launch_sniper_enabled",
+        "PERP_LONG":"perp_long_engine_enabled",
+        "PERP_SHORT":"perp_short_engine_enabled",
+    }
+    key=mapping.get(str(strategy or "").upper())
+    return True if not key else b(key)
+
+def engine_controls_status():
+    return {
+        "scalp":b("scalp_engine_enabled"),
+        "pump":b("pump_engine_enabled"),
+        "sniper":b("sniper_enabled"),
+        "launch":b("launch_sniper_enabled"),
+        "perp_long":b("perp_long_engine_enabled"),
+        "perp_short":b("perp_short_engine_enabled"),
+        "realtime_pulse":b("realtime_pulse_enabled"),
+        "paid_stream":b("paid_trade_stream_enabled"),
+        "selective_router":b("selective_entry_router_enabled"),
+        "existing_positions_managed":True,
+        "safety_exits_locked_on":True,
+    }
+
 
 app = FastAPI(title="NOVA Trader Cloud", version=APP_VERSION)
 app.add_middleware(
@@ -2460,6 +2496,8 @@ def survival_guard_status():
 def gate(c,strategy=None):
     if b("killed"): return False,"kill switch"
     if not b("bot_enabled"): return False,"bot stopped"
+    if strategy and not strategy_manual_enabled(strategy):
+        return False,"engine manually disabled"
 
     health=source_health()
     if health["last_loop_age_sec"]>f("max_data_age_sec"):
@@ -3353,7 +3391,7 @@ def launch_metrics(mint):
     return m
 
 def launch_gate(m):
-    if not b("launch_sniper_enabled"):return False,"launch sniper off"
+    if not strategy_manual_enabled("LAUNCH_SNIPER"):return False,"launch sniper off"
     if operating_mode()!="PAPER":return False,"launch sniper paper only"
     if b("killed") or not b("bot_enabled"):return False,"bot stopped"
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:
@@ -3809,7 +3847,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.8.1"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.8.2"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -4186,7 +4224,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.8.1"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.8.2"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -4324,7 +4362,7 @@ def _ws_capture_provider_message(data):
         )
 
 def _trade_subscription_allowed():
-    return time.time() >= nz(runtime.get("ws_subscription_blocked_until"))
+    return b("paid_trade_stream_enabled") and time.time() >= nz(runtime.get("ws_subscription_blocked_until"))
 
 def _trade_subscription_blocked_for():
     return round(max(0,nz(runtime.get("ws_subscription_blocked_until"))-time.time()),1)
@@ -4364,6 +4402,7 @@ async def _cost_balance():
 
 def _cost_block():
     _cost_roll()
+    if not b("paid_trade_stream_enabled"):return "manual_off"
     b=runtime.get("metered_wallet_balance")
     if b is not None and nz(b)<=METERED_FLOOR:return "wallet_floor"
     if int(runtime.get("metered_events_h",0))>=METERED_MAX_EVENTS_H:return "hourly_budget"
@@ -4389,7 +4428,7 @@ async def cost_sync_pulse_subscriptions(ws):
         try:
             await _cost_balance();_cost_roll();n=time.time();subs=list(runtime.get("pulse_subscribed",set()))
             reason=_cost_block()
-            if reason in ("wallet_floor","hourly_budget","provider_breaker"):
+            if reason in ("manual_off","wallet_floor","hourly_budget","provider_breaker"):
                 runtime["metered_state"]="PAUSED_"+reason.upper()
                 await _cost_unsub(ws,subs,reason)
             else:
@@ -4407,7 +4446,7 @@ async def cost_sync_pulse_subscriptions(ws):
 
 def metered_cost_status():
     _cost_roll();e=int(runtime.get("metered_events_h",0));b=runtime.get("metered_wallet_balance")
-    return {"enabled":METERED_OPT,"state":runtime.get("metered_state"),
+    return {"enabled":METERED_OPT,"manual_stream_enabled":b("paid_trade_stream_enabled"),"state":runtime.get("metered_state"),
       "active_paid_subscriptions":len(runtime.get("pulse_subscribed",set())),"active_cap":_cost_cap(),
       "token_ttl_sec":METERED_TTL,"new_subscriptions_this_minute":runtime.get("metered_subs_min",0),
       "new_subscriptions_per_min_limit":METERED_MAX_SUBS_MIN,"events_this_hour":e,
@@ -4734,7 +4773,7 @@ async def pumpportal_realtime_loop():
         runtime["pulse_ws_loop_started"]=False
 
 def sniper_gate(c):
-    if not b("sniper_enabled"):
+    if not strategy_manual_enabled("SNIPER_LONG"):
         return False,"sniper disabled"
     if c.get("perp_eligible"):
         return False,"sniper spot only"
@@ -4762,7 +4801,7 @@ def sniper_gate(c):
     return gate(c,"SNIPER_LONG")
 
 async def choose_sniper_entry():
-    if not b("bot_enabled") or b("killed") or not b("sniper_enabled"):
+    if not b("bot_enabled") or b("killed") or not strategy_manual_enabled("SNIPER_LONG"):
         return
     async with entry_lock:
         ranked=sorted(
@@ -4803,22 +4842,22 @@ def choose_entry():
     for c in runtime["candidates"]:
         if c.get("perp_eligible"):
             if c.get("data_source")=="VELOCITY":
-                if c.get("direction")=="LONG" and c["long_score"]>=effective_threshold("PERP_LONG",c):
+                if strategy_manual_enabled("PERP_LONG") and c.get("direction")=="LONG" and c["long_score"]>=effective_threshold("PERP_LONG",c):
                     opportunities.append((c["long_score"],c,"PERP_LONG"))
-                elif c.get("direction")=="SHORT" and c["short_score"]>=effective_threshold("PERP_SHORT",c):
+                elif strategy_manual_enabled("PERP_SHORT") and c.get("direction")=="SHORT" and c["short_score"]>=effective_threshold("PERP_SHORT",c):
                     opportunities.append((c["short_score"],c,"PERP_SHORT"))
             else:
-                if c["long_score"]>=effective_threshold("PERP_LONG",c):
+                if strategy_manual_enabled("PERP_LONG") and c["long_score"]>=effective_threshold("PERP_LONG",c):
                     opportunities.append((c["long_score"],c,"PERP_LONG"))
-                if c["short_score"]>=effective_threshold("PERP_SHORT",c):
+                if strategy_manual_enabled("PERP_SHORT") and c["short_score"]>=effective_threshold("PERP_SHORT",c):
                     opportunities.append((c["short_score"],c,"PERP_SHORT"))
         else:
             margin=profit_router_signal_deficit()
             pump_th=effective_threshold("PUMP_LONG",c)
             scalp_th=effective_threshold("SCALP_LONG",c)
-            if c["pump_score"]>=pump_th-margin:
+            if strategy_manual_enabled("PUMP_LONG") and c["pump_score"]>=pump_th-margin:
                 opportunities.append((c["pump_score"],c,"PUMP_LONG"))
-            if c["scalp_score"]>=scalp_th-margin:
+            if strategy_manual_enabled("SCALP_LONG") and c["scalp_score"]>=scalp_th-margin:
                 opportunities.append((c["scalp_score"],c,"SCALP_LONG"))
 
     ranked=[]
@@ -4898,7 +4937,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.8.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.8.2"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -4960,7 +4999,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.8.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.8.2"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5009,7 +5048,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.2"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -5184,6 +5223,12 @@ class SettingsIn(BaseModel):
     capital_shield_min_market_quality: Optional[float]=None
     max_spot_position_liquidity_pct: Optional[float]=None
     max_spot_abs_m5_pct: Optional[float]=None
+
+    scalp_engine_enabled: Optional[bool]=None
+    pump_engine_enabled: Optional[bool]=None
+    perp_long_engine_enabled: Optional[bool]=None
+    perp_short_engine_enabled: Optional[bool]=None
+    paid_trade_stream_enabled: Optional[bool]=None
 
     sniper_enabled: Optional[bool]=None
     min_sniper_score: Optional[float]=None
@@ -5373,6 +5418,7 @@ def dashboard():
         "mode":operating_mode(),
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
+        "engine_controls":engine_controls_status(),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,
         "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"],
         "velocity_source_ok":runtime["velocity_source_ok"],
@@ -5547,6 +5593,11 @@ def dashboard():
             "security_hard_block_shadow":b("security_hard_block_shadow"),
             "profit_lock_enabled":b("profit_lock_enabled"),
             "capital_shield_enabled":b("capital_shield_enabled"),
+            "scalp_engine_enabled":b("scalp_engine_enabled"),
+            "pump_engine_enabled":b("pump_engine_enabled"),
+            "perp_long_engine_enabled":b("perp_long_engine_enabled"),
+            "perp_short_engine_enabled":b("perp_short_engine_enabled"),
+            "paid_trade_stream_enabled":b("paid_trade_stream_enabled"),
             "sniper_enabled":b("sniper_enabled"),
             "realtime_pulse_enabled":b("realtime_pulse_enabled"),
             "realtime_exit_enabled":b("realtime_exit_enabled"),
@@ -5647,7 +5698,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.2"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -5661,8 +5712,63 @@ def full_status():
     return {
         "version":APP_VERSION,"mode":operating_mode(),"live_execution_locked":LIVE_EXECUTION_LOCKED,
         "health":source_health(),"readiness":live_readiness(),"metrics":metrics(),
+        "engine_controls":engine_controls_status(),
         "adaptive":adaptive_status(),"portfolio":portfolio_status(),"execution":execution_stats(),
         "research_status":snapshot_stats(),"security":token_security_status()
+    }
+
+ENGINE_CONTROL_KEYS={
+    "scalp":"scalp_engine_enabled",
+    "pump":"pump_engine_enabled",
+    "sniper":"sniper_enabled",
+    "launch":"launch_sniper_enabled",
+    "perp_long":"perp_long_engine_enabled",
+    "perp_short":"perp_short_engine_enabled",
+    "realtime_pulse":"realtime_pulse_enabled",
+    "paid_stream":"paid_trade_stream_enabled",
+    "selective_router":"selective_entry_router_enabled",
+}
+
+@app.get("/api/engines")
+def engines():
+    return {
+        "version":APP_VERSION,
+        "controls":engine_controls_status(),
+        "note":"OFF blocks new entries only. Existing positions remain under automatic exit/risk management."
+    }
+
+@app.post("/api/engines/{engine_name}/{state}")
+def set_engine_control(engine_name:str,state:str,x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
+    name=engine_name.strip().lower()
+    key=ENGINE_CONTROL_KEYS.get(name)
+    if not key:
+        raise HTTPException(400,"Unknown engine control")
+    state_norm=state.strip().lower()
+    if state_norm not in ("on","off","true","false","1","0"):
+        raise HTTPException(400,"state must be on or off")
+    enabled=state_norm in ("on","true","1")
+    setv(key,"true" if enabled else "false")
+
+    # Clear pending confirmations/evaluations so an OFF engine cannot fire a
+    # stale entry when it is switched back later.
+    if not enabled:
+        if name=="launch":
+            runtime["launch_confirmations"].clear()
+        elif name in ("sniper","realtime_pulse"):
+            runtime["pulse_confirmations"].clear()
+        elif name=="selective_router":
+            runtime["router_last_entry"]=None
+
+    record_event(
+        "INFO","ENGINE_CONTROL",
+        f"{name} manually {'enabled' if enabled else 'disabled'}",
+        {"engine":name,"enabled":enabled},dedupe_sec=1
+    )
+    return {
+        "ok":True,"engine":name,"enabled":enabled,
+        "controls":engine_controls_status(),
+        "existing_positions_managed":True
     }
 
 @app.post("/api/mode/{mode}")
