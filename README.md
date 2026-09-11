@@ -1,1 +1,0 @@
-# nova-trader-cloud-v2
