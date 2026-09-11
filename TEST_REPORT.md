@@ -1,21 +1,26 @@
-# NOVA Trader V7.1.0 — Build Test Report
+# NOVA Trader V7.1.1 — Stability Hotfix Test Report
 
 Validated in the build workspace:
 
-- Python compile: `app.py` — PASS
+- Python compile (`python -m py_compile app.py`) — PASS
 - Dashboard JavaScript syntax (`node --check`) — PASS
-- Indicator logic with synthetic bullish/bearish 240-candle series — PASS
-- Multi-timeframe aggregation (5m/15m/1h/4h) — PASS
-- Strong opposite candle confirmation gate — PASS
-- FastAPI smoke: `/health` returns `7.1.0` — PASS
-- Authenticated `/api/candle-intelligence` — PASS
-- Authenticated `/api/dashboard` contains `candle_intelligence` — PASS
-- Invalid NOVA Admin Key rejected with 401 — PASS
-- LIVE execution remains hard-locked in source — PASS
+- Import smoke test with isolated SQLite DB — PASS
+- `/health` direct function smoke — PASS (`version=7.1.1`)
+- Admin auth check with configured test key — PASS
+- Candle status includes worker/in-flight fields — PASS
+- Static regression: core `engine_loop()` no longer awaits candle refresh — PASS
+- Static regression: dedicated `candle_intelligence_loop()` is started on startup — PASS
+- Static regression: old `setInterval(load,5000)` removed — PASS
+- Static regression: single-flight load guard + 3-failure disconnect threshold present — PASS
 
-Not validated inside this isolated build container:
+Not validated in this isolated runtime:
 
-- Live outbound Binance HTTP calls (container DNS/network is unavailable here).
-- Northflank container build/runtime behavior.
+- Real Northflank scheduling/resource behavior.
+- Live outbound Binance/PumpPortal stability under production network conditions.
 
-After Northflank deployment, confirm `/health`, the Candle Intelligence card, and that `TRACKED` becomes non-zero after the first candle refresh.
+After deploy, verify:
+
+1. `/health` reports `7.1.1`.
+2. Dashboard stays `CONNECTED` during short latency spikes, or shows `RETRYING` instead of flickering `DISCONNECTED`.
+3. Candle Intelligence continues updating while core market scans remain responsive.
+4. PumpPortal realtime status is evaluated separately from API connection status.

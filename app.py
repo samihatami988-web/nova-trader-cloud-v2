@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.1.1"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -55,6 +55,11 @@ CANDLE_HARD_GATE = os.getenv("NOVA_CANDLE_HARD_GATE", "true").lower() in ("1","t
 CANDLE_GATE_MIN_CONFIDENCE = max(50.0, min(90.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_CONFIDENCE", "65"))))
 CANDLE_GATE_OPPOSITE_SCORE = max(65.0, min(95.0, float(os.getenv("NOVA_CANDLE_GATE_OPPOSITE_SCORE", "80"))))
 CANDLE_GATE_MIN_EDGE = max(10.0, min(35.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_EDGE", "20"))))
+# V7.1.1 stability: Candle OHLCV runs outside the main market loop and uses short, bounded HTTP calls.
+CANDLE_HTTP_TIMEOUT_SEC = max(3.0, min(12.0, float(os.getenv("NOVA_CANDLE_HTTP_TIMEOUT_SEC", "7"))))
+CANDLE_HTTP_RETRIES = max(0, min(2, int(float(os.getenv("NOVA_CANDLE_HTTP_RETRIES", "1")))))
+CANDLE_WORKER_TICK_SEC = max(3.0, min(15.0, float(os.getenv("NOVA_CANDLE_WORKER_TICK_SEC", "8"))))
+CANDLE_EFFECTIVE_CONCURRENCY = min(CANDLE_CONCURRENCY, 4 if FREE_LITE else CANDLE_CONCURRENCY)
 
 PUMPPORTAL_API_KEY_RAW = os.getenv("PUMPPORTAL_API_KEY","")
 PUMPPORTAL_API_KEY = PUMPPORTAL_API_KEY_RAW.strip()
@@ -712,10 +717,16 @@ runtime.update({
     "candle_refresh_count": 0,
     "candle_errors": {},
     "candle_targets": [],
+    "candle_worker_alive": False,
+    "candle_refresh_inflight": False,
+    "candle_refresh_duration_ms": None,
+    "candle_worker_error": None,
+    "candle_worker_failures": 0,
 })
 
 position_manage_lock = asyncio.Lock()
 entry_lock = asyncio.Lock()
+candle_refresh_lock = asyncio.Lock()
 
 def normalize_admin_key(value: Optional[str]) -> str:
     key = str(value or "").strip()
@@ -1579,9 +1590,27 @@ def _combine_candle_timeframes(tf_map):
 async def _fetch_binance_klines(client,symbol,timeframe,futures=False):
     base=BINANCE_FUTURES_BASE if futures else BINANCE_SPOT_BASE
     path="/fapi/v1/klines" if futures else "/api/v3/klines"
-    r=await client.get(base+path,params={"symbol":symbol,"interval":timeframe,"limit":CANDLE_KLINE_LIMIT},timeout=15)
-    r.raise_for_status();body=r.json()
-    return body if isinstance(body,list) else []
+    last=None
+    for attempt in range(CANDLE_HTTP_RETRIES+1):
+        try:
+            r=await client.get(
+                base+path,
+                params={"symbol":symbol,"interval":timeframe,"limit":CANDLE_KLINE_LIMIT},
+                timeout=httpx.Timeout(CANDLE_HTTP_TIMEOUT_SEC,connect=min(4.0,CANDLE_HTTP_TIMEOUT_SEC))
+            )
+            # Rate-limit responses should fail fast; retrying a burst makes provider pressure worse.
+            if r.status_code==429:
+                r.raise_for_status()
+            r.raise_for_status();body=r.json()
+            return body if isinstance(body,list) else []
+        except (httpx.TimeoutException,httpx.TransportError,httpx.HTTPStatusError) as e:
+            last=e
+            status=getattr(getattr(e,"response",None),"status_code",None)
+            if status==429 or attempt>=CANDLE_HTTP_RETRIES:
+                raise
+            await asyncio.sleep(0.25*(attempt+1)+random.random()*0.15)
+    if last:raise last
+    return []
 
 def _candle_target(c):
     source=str(c.get("data_source") or "")
@@ -1612,47 +1641,61 @@ def _select_candle_targets(pairs):
     return selected
 
 async def refresh_candle_intelligence(client,pairs,force=False):
-    if not CANDLE_ENGINE_ENABLED:return
+    if not CANDLE_ENGINE_ENABLED:return False
     now=time.time()
-    if not force and now-nz(runtime.get("candle_last_refresh_ts"))<CANDLE_REFRESH_SEC:return
-    targets=_select_candle_targets(pairs)
-    runtime["candle_targets"]=[{"mint":c.get("mint"),"symbol":c.get("symbol"),"market":t[0],"futures":t[1]} for c,t in targets]
-    sem=asyncio.Semaphore(CANDLE_CONCURRENCY)
-    errors={}
-    async def one(c,target):
-        market,futures=target;tf_map={}
-        async def tf_job(tf):
-            try:
-                async with sem:
-                    rows=await _fetch_binance_klines(client,market,tf,futures)
-                return tf,_tf_candle_features(rows,tf),None
-            except Exception as e:return tf,None,str(e)[:160]
-        results=await asyncio.gather(*(tf_job(tf) for tf in CANDLE_TIMEFRAMES))
-        for tf,feat,err in results:
-            if feat:tf_map[tf]=feat
-            elif err:errors[f"{c.get('mint')}:{tf}"]=err
-        combined=_combine_candle_timeframes(tf_map)
-        if not combined:return c.get("mint"),None
-        combined.update({"mint":c.get("mint"),"symbol":c.get("symbol"),"market":market,
-                         "venue":"BINANCE_FUTURES" if futures else "BINANCE_SPOT",
-                         "asset_class":c.get("asset_class"),"updated_at":datetime.now(timezone.utc).isoformat()})
-        return c.get("mint"),combined
-    results=await asyncio.gather(*(one(c,t) for c,t in targets)) if targets else []
-    cache=dict(runtime.get("candle_intelligence") or {})
-    active=set()
-    for mint,intel in results:
-        if mint and intel:cache[mint]=intel;active.add(mint)
-    # Keep a small cache for temporary ranking changes but prune stale entries after 15 minutes.
-    cutoff=datetime.now(timezone.utc)-timedelta(minutes=15)
-    for k,v in list(cache.items()):
+    if not force and now-nz(runtime.get("candle_last_refresh_ts"))<CANDLE_REFRESH_SEC:return False
+    if candle_refresh_lock.locked():return False
+    async with candle_refresh_lock:
+        started=time.monotonic()
+        runtime["candle_refresh_inflight"]=True
         try:
-            ts=datetime.fromisoformat(str(v.get("updated_at")))
-            if ts.tzinfo is None:ts=ts.replace(tzinfo=timezone.utc)
-            if ts<cutoff:cache.pop(k,None)
-        except Exception:cache.pop(k,None)
-    runtime["candle_intelligence"]=cache;runtime["candle_errors"]=errors
-    runtime["candle_last_refresh_ts"]=now;runtime["candle_last_refresh"]=datetime.now(timezone.utc).isoformat()
-    runtime["candle_refresh_count"]=int(runtime.get("candle_refresh_count",0))+1
+            targets=_select_candle_targets(pairs)
+            runtime["candle_targets"]=[{"mint":c.get("mint"),"symbol":c.get("symbol"),"market":t[0],"futures":t[1]} for c,t in targets]
+            sem=asyncio.Semaphore(CANDLE_EFFECTIVE_CONCURRENCY)
+            errors={}
+            async def one(c,target):
+                market,futures=target;tf_map={}
+                async def tf_job(tf):
+                    try:
+                        async with sem:
+                            rows=await _fetch_binance_klines(client,market,tf,futures)
+                        return tf,_tf_candle_features(rows,tf),None
+                    except Exception as e:return tf,None,str(e)[:160]
+                results=await asyncio.gather(*(tf_job(tf) for tf in CANDLE_TIMEFRAMES))
+                for tf,feat,err in results:
+                    if feat:tf_map[tf]=feat
+                    elif err:errors[f"{c.get('mint')}:{tf}"]=err
+                combined=_combine_candle_timeframes(tf_map)
+                if not combined:return c.get("mint"),None
+                combined.update({"mint":c.get("mint"),"symbol":c.get("symbol"),"market":market,
+                                 "venue":"BINANCE_FUTURES" if futures else "BINANCE_SPOT",
+                                 "asset_class":c.get("asset_class"),"updated_at":datetime.now(timezone.utc).isoformat()})
+                return c.get("mint"),combined
+            results=await asyncio.gather(*(one(c,t) for c,t in targets)) if targets else []
+            cache=dict(runtime.get("candle_intelligence") or {})
+            for mint,intel in results:
+                if mint and intel:cache[mint]=intel
+            cutoff=datetime.now(timezone.utc)-timedelta(minutes=15)
+            for k,v in list(cache.items()):
+                try:
+                    ts=datetime.fromisoformat(str(v.get("updated_at")))
+                    if ts.tzinfo is None:ts=ts.replace(tzinfo=timezone.utc)
+                    if ts<cutoff:cache.pop(k,None)
+                except Exception:cache.pop(k,None)
+            runtime["candle_intelligence"]=cache;runtime["candle_errors"]=errors
+            runtime["candle_last_refresh_ts"]=now;runtime["candle_last_refresh"]=datetime.now(timezone.utc).isoformat()
+            runtime["candle_refresh_count"]=int(runtime.get("candle_refresh_count",0))+1
+            runtime["candle_worker_error"]=None
+            runtime["candle_worker_failures"]=0
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            runtime["candle_worker_error"]=str(e)[:220]
+            raise
+        finally:
+            runtime["candle_refresh_inflight"]=False
+            runtime["candle_refresh_duration_ms"]=round((time.monotonic()-started)*1000,1)
 
 def apply_candle_overlay(pairs):
     if not CANDLE_ENGINE_ENABLED:return pairs
@@ -1701,7 +1744,10 @@ def candle_intelligence_status():
     return {"enabled":CANDLE_ENGINE_ENABLED,"hard_gate":CANDLE_HARD_GATE,"tracked":len(cache),"majors":majors,
             "bullish":bullish,"bearish":bearish,"neutral":neutral,"timeframes":list(CANDLE_TIMEFRAMES),
             "last_refresh":runtime.get("candle_last_refresh"),"refresh_count":runtime.get("candle_refresh_count",0),
-            "errors":len(runtime.get("candle_errors") or {}),"top":[small(x) for x in top]}
+            "errors":len(runtime.get("candle_errors") or {}),"worker_alive":bool(runtime.get("candle_worker_alive")),
+            "refresh_inflight":bool(runtime.get("candle_refresh_inflight")),"refresh_duration_ms":runtime.get("candle_refresh_duration_ms"),
+            "worker_error":runtime.get("candle_worker_error"),"worker_failures":runtime.get("candle_worker_failures",0),
+            "top":[small(x) for x in top]}
 
 def _binance_perp_candidate(info,ticker,premium):
     symbol=str(ticker.get("symbol") or "");base_asset=str(info.get("baseAsset") or symbol).upper();price=nz((premium or {}).get("markPrice"),nz(ticker.get("lastPrice")))
@@ -5613,7 +5659,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.1"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5662,10 +5708,37 @@ def today_guard_status():
         "remaining_before_guard":max(0,realized-limit) if realized>limit else 0
     }
 
+async def candle_intelligence_loop():
+    """Independent, fail-open candle worker. Never blocks the core market/position engine."""
+    if not CANDLE_ENGINE_ENABLED:
+        runtime["candle_worker_alive"]=False
+        return
+    runtime["candle_worker_alive"]=True
+    limits=httpx.Limits(max_connections=max(4,CANDLE_EFFECTIVE_CONCURRENCY+2),max_keepalive_connections=max(2,CANDLE_EFFECTIVE_CONCURRENCY))
+    timeout=httpx.Timeout(CANDLE_HTTP_TIMEOUT_SEC,connect=min(4.0,CANDLE_HTTP_TIMEOUT_SEC))
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Candle-Brain/7.1.1"},limits=limits,timeout=timeout) as client:
+            while True:
+                try:
+                    pairs=list(runtime.get("candidates") or [])
+                    if pairs:
+                        await refresh_candle_intelligence(client,pairs)
+                    runtime["candle_worker_alive"]=True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    runtime["candle_worker_error"]=str(e)[:220]
+                    runtime["candle_worker_failures"]=int(runtime.get("candle_worker_failures",0))+1
+                    record_event("WARN","CANDLE_WORKER_ERROR",str(e)[:220],{"failures":runtime["candle_worker_failures"]},dedupe_sec=180)
+                await asyncio.sleep(CANDLE_WORKER_TICK_SEC)
+    finally:
+        runtime["candle_worker_alive"]=False
+        runtime["candle_refresh_inflight"]=False
+
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA V7.1 universal + candle-intelligence engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.0"}) as client:
+    record_event("INFO","ENGINE_START","NOVA V7.1.1 universal + candle-intelligence engine loop started",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.1"}) as client:
         addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
@@ -5707,9 +5780,8 @@ async def engine_loop():
                 merged={c["mint"]:c for c in spot_pairs}
                 for c in velocity_pairs+binance_perps:merged[c["mint"]]=c
                 pairs=list(merged.values())
-                # V7.1: augment top CEX markets with multi-timeframe OHLCV intelligence.
-                # The overlay is deliberately weighted; existing flow/momentum signals remain primary.
-                await refresh_candle_intelligence(client,pairs)
+                # V7.1.1: Candle OHLCV refresh is handled by an independent background worker.
+                # The main trading loop only consumes the latest cache, so slow Binance candles cannot stall NOVA.
                 apply_candle_overlay(pairs)
                 pairs.sort(key=lambda x:max(nz(x.get("pump_score")),nz(x.get("scalp_score")),nz(x.get("long_score")),nz(x.get("short_score"))),reverse=True)
 
@@ -5764,6 +5836,7 @@ async def startup():
         runtime["daily_target_locked"]=False
         runtime["daily_target_lock_time"]=None
     asyncio.create_task(engine_loop())
+    asyncio.create_task(candle_intelligence_loop())
     asyncio.create_task(position_watch_loop())
     asyncio.create_task(sniper_scan_loop())
     asyncio.create_task(pumpportal_realtime_loop())
@@ -6013,7 +6086,11 @@ def health():
         "pumpportal_stream_enabled":bool(PUMPPORTAL_TRADE_STREAM_ENABLED),
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "admin_key_configured":ADMIN_KEY_CONFIGURED,
-        "cors_enabled":True
+        "cors_enabled":True,
+        "candle_worker_alive":bool(runtime.get("candle_worker_alive")),
+        "candle_refresh_inflight":bool(runtime.get("candle_refresh_inflight")),
+        "candle_refresh_duration_ms":runtime.get("candle_refresh_duration_ms"),
+        "candle_worker_failures":runtime.get("candle_worker_failures",0)
     }
 
 @app.get("/api/auth-check")
