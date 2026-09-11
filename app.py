@@ -5,13 +5,13 @@ from urllib.parse import quote
 import httpx
 import websockets
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.8.2"
+APP_VERSION = "6.8.3"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -71,8 +71,6 @@ MICRO_ROUTER_QUALITY=max(58.0,min(72.0,float(os.getenv("NOVA_MICRO_ROUTER_MIN_QU
 MICRO_ROUTER_LIQ=max(25000.0,float(os.getenv("NOVA_MICRO_ROUTER_MIN_LIQ","35000")))
 MICRO_ROUTER_BUY_PRESSURE=max(55.0,min(75.0,float(os.getenv("NOVA_MICRO_ROUTER_MIN_BUY_PRESSURE","60"))))
 MICRO_SOFT_ENTRIES_H=max(2,min(8,int(float(os.getenv("NOVA_MICRO_SOFT_ENTRIES_PER_HOUR","6")))))
-MICRO_UNLIMITED_PROFIT=os.getenv("NOVA_MICRO_UNLIMITED_PROFIT","true").lower() in ("1","true","yes","on")
-MICRO_PROFILE_VERSION="micro-profit-v1"
 
 
 
@@ -82,16 +80,15 @@ PERP_UNIVERSE = {
     "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": {"market": "BTC-PERP", "symbol": "BTC"},
     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": {"market": "ETH-PERP", "symbol": "ETH"},
 }
-ADMIN_KEY = os.getenv("NOVA_ADMIN_KEY", "").strip()
-ALLOWED_ORIGINS = [
-    origin.strip().rstrip("/")
-    for origin in os.getenv("NOVA_ALLOWED_ORIGINS", "").split(",")
-    if origin.strip()
-]
-if not ADMIN_KEY:
-    # Fail closed for every protected operation. The service can still answer
-    # health checks, but it must not accept an implicit/default admin key.
-    print("WARNING: NOVA_ADMIN_KEY is not configured; protected API calls are disabled")
+ADMIN_KEY_RAW = os.getenv("NOVA_ADMIN_KEY", "")
+ADMIN_KEY = ADMIN_KEY_RAW.strip()
+if (
+    len(ADMIN_KEY) >= 2
+    and ADMIN_KEY[0] in ('"', "'")
+    and ADMIN_KEY[-1] == ADMIN_KEY[0]
+):
+    ADMIN_KEY = ADMIN_KEY[1:-1].strip()
+ADMIN_KEY_CONFIGURED = bool(ADMIN_KEY)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nova_trader.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -252,11 +249,11 @@ DEFAULTS = {
     "start_balance": os.getenv("PAPER_START_BALANCE", "5000"),
     "bot_enabled": "false",
     "killed": "false",
-    "risk_pct": "0.35",
+    "risk_pct": "0.75",
     "max_position_pct": "10",
     "max_positions": "4",
     "stop_loss_pct": "4",
-    "daily_loss_limit_pct": "10",
+    "daily_loss_limit_pct": "3",
     "min_pump_score": "72",
     "min_scalp_score": "74",
     "min_long_score": "72",
@@ -445,10 +442,9 @@ DEFAULTS = {
     "daily_profit_secure_buffer_pct": "0.25",
     "daily_de_risk_start_pct": "7.0",
     "daily_de_risk_multiplier": "0.50",
-    "daily_target_lock_enabled": "false",
+    "daily_target_lock_enabled": "true",
     "no_martingale": "true",
     "max_total_open_risk_pct": "3.0",
-    "micro_profit_profile_version": "",
 
     "position_watch_interval_sec": "8",
     "stale_position_price_sec": "45",
@@ -522,28 +518,19 @@ def engine_controls_status():
 
 
 app = FastAPI(title="NOVA Trader Cloud", version=APP_VERSION)
+
+# Browser dashboard is hosted on GitHub Pages and talks to this Northflank API
+# cross-origin. Keep CORS explicit and preflight-friendly. Credentials/cookies are
+# not used; admin authentication is carried only in the X-NOVA-Key header.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-NOVA-Key", "X-Requested-With"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "X-NOVA-Key"],
+    expose_headers=["X-NOVA-Version"],
+    max_age=86400,
 )
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
-    )
-    if request.url.scheme == "https":
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    return response
 
 runtime = {
     "candidates": [],
@@ -669,10 +656,17 @@ runtime = {
 position_manage_lock = asyncio.Lock()
 entry_lock = asyncio.Lock()
 
+def normalize_admin_key(value: Optional[str]) -> str:
+    key = str(value or "").strip()
+    if len(key) >= 2 and key[0] in ('"', "'") and key[-1] == key[0]:
+        key = key[1:-1].strip()
+    return key
+
 def auth(x_nova_key: Optional[str]):
-    if not ADMIN_KEY:
-        raise HTTPException(503, "Admin authentication is not configured")
-    if not x_nova_key or not hmac.compare_digest(x_nova_key, ADMIN_KEY):
+    if not ADMIN_KEY_CONFIGURED:
+        raise HTTPException(503, "NOVA admin key is not configured on the server")
+    candidate = normalize_admin_key(x_nova_key)
+    if not candidate or not hmac.compare_digest(candidate, ADMIN_KEY):
         raise HTTPException(401, "Invalid NOVA admin key")
 
 def nz(v, d=0.0):
@@ -2612,7 +2606,8 @@ def gate(c,strategy=None):
     if cd and time.time()<cd:
         return False,"cooldown"
 
-    if today_guard_status()["blocked"]:
+    start_balance=f("start_balance")
+    if today_realized() <= -(start_balance*f("daily_loss_limit_pct")/100):
         return False,"daily loss limit"
     if b("capital_shield_enabled") and global_equity_guard_status()["blocked"]:
         return False,"global equity guard"
@@ -3023,12 +3018,6 @@ def manage_positions():
         record_event("INFO","DAILY_TARGET_SECURE","Daily profit target secure triggered",
                      {"combined":target["combined"],"target_usd":target["target_usd"]},dedupe_sec=60)
 
-    daily_loss=today_guard_status()
-    daily_loss_flatten=daily_loss["blocked"] and bool(pos)
-    if daily_loss_flatten:
-        record_event("WARN","DAILY_LOSS_GUARD","Daily loss limit triggered; flattening open positions",
-                     {"combined_pnl":daily_loss["combined_pnl"],"limit_usd":daily_loss["loss_limit_usd"]},dedupe_sec=60)
-
     for p in pos:
         c=cands.get(p.mint)
         if not c:
@@ -3071,9 +3060,7 @@ def manage_positions():
                 max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
-            if daily_loss_flatten:
-                reason="DAILY_LOSS_LIMIT"
-            elif secure_daily:
+            if secure_daily:
                 reason="DAILY_TARGET_SECURE"
             elif survival_flatten:
                 reason="SURVIVAL_GUARD"
@@ -3095,13 +3082,13 @@ def manage_positions():
                 reason="LAUNCH_FLOW_REVERSAL"
 
             # Micro Profit Cycle: bank small NET wins quickly.
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="SCALP_LONG" and net_ret>=MICRO_SCALP_TP:
+            elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="SCALP_LONG" and net_ret>=MICRO_SCALP_TP:
                 reason="MICRO_PROFIT_TAKE"
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="PUMP_LONG" and net_ret>=MICRO_PUMP_TP:
+            elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="PUMP_LONG" and net_ret>=MICRO_PUMP_TP:
                 reason="MICRO_PROFIT_TAKE"
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="SNIPER_LONG" and net_ret>=MICRO_SNIPER_TP:
+            elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="SNIPER_LONG" and net_ret>=MICRO_SNIPER_TP:
                 reason="MICRO_PROFIT_TAKE"
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="LAUNCH_SNIPER" and net_ret>=MICRO_LAUNCH_TP:
+            elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="LAUNCH_SNIPER" and net_ret>=MICRO_LAUNCH_TP:
                 reason="MICRO_PROFIT_TAKE"
             elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="SCALP_LONG" and held_seconds>=MICRO_SCALP_SCRATCH_SEC and peak_net_ret<.35 and net_ret<=-MICRO_SCALP_SCRATCH_LOSS:
                 reason="MICRO_SCALP_SCRATCH"
@@ -3109,9 +3096,9 @@ def manage_positions():
                 reason="MICRO_PUMP_SCRATCH"
             elif profit_cycle_active() and MICRO_PROFIT_ENABLED and obj.strategy=="LAUNCH_SNIPER" and held_seconds>=MICRO_LAUNCH_SCRATCH_SEC and peak_net_ret<1.25 and net_ret<=-MICRO_LAUNCH_SCRATCH_LOSS:
                 reason="MICRO_LAUNCH_SCRATCH"
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and obj.strategy=="SCALP_LONG" and net_ret>=PROFIT_SCALP_FULL_TP_PCT:
+            elif profit_cycle_active() and obj.strategy=="SCALP_LONG" and net_ret>=PROFIT_SCALP_FULL_TP_PCT:
                 reason="PROFIT_CYCLE_TAKE"
-            elif (not MICRO_UNLIMITED_PROFIT) and profit_cycle_active() and obj.strategy=="PUMP_LONG" and net_ret>=PROFIT_PUMP_FULL_TP_PCT:
+            elif profit_cycle_active() and obj.strategy=="PUMP_LONG" and net_ret>=PROFIT_PUMP_FULL_TP_PCT:
                 reason="PROFIT_CYCLE_TAKE"
 
             # Strategy-specific hard stop is intentionally tighter than the user-visible
@@ -3883,7 +3870,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.8.2"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.8.3"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -4260,7 +4247,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.8.2"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.8.3"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -4481,7 +4468,9 @@ async def cost_sync_pulse_subscriptions(ws):
         await asyncio.sleep(1.25)
 
 def metered_cost_status():
-    _cost_roll();e=int(runtime.get("metered_events_h",0));wallet_balance=runtime.get("metered_wallet_balance")
+    _cost_roll()
+    e=int(runtime.get("metered_events_h",0))
+    wallet_balance=runtime.get("metered_wallet_balance")
     return {"enabled":METERED_OPT,"manual_stream_enabled":b("paid_trade_stream_enabled"),"state":runtime.get("metered_state"),
       "active_paid_subscriptions":len(runtime.get("pulse_subscribed",set())),"active_cap":_cost_cap(),
       "token_ttl_sec":METERED_TTL,"new_subscriptions_this_minute":runtime.get("metered_subs_min",0),
@@ -4516,11 +4505,6 @@ def profit_cycle_status():
         "soft_entries_hour_cap":profit_router_hourly_cap(),
         "micro_profit":{
             "enabled":bool(MICRO_PROFIT_ENABLED and profit_cycle_active()),
-            "profile":MICRO_PROFILE_VERSION,
-            "unlimited_profit":MICRO_UNLIMITED_PROFIT,
-            "per_trade_risk_pct":f("risk_pct"),
-            "daily_loss_limit_pct":f("daily_loss_limit_pct"),
-            "daily_loss_action":"FLATTEN_AND_STOP_NEW_ENTRIES",
             "scalp_tp_pct":MICRO_SCALP_TP,"pump_tp_pct":MICRO_PUMP_TP,
             "sniper_tp_pct":MICRO_SNIPER_TP,"launch_tp_pct":MICRO_LAUNCH_TP,
             "scalp_max_hold_min":MICRO_SCALP_MAX_HOLD,
@@ -4531,7 +4515,7 @@ def profit_cycle_status():
             "router_liquidity_floor":profit_router_liquidity_floor(),
             "router_buy_pressure_floor":MICRO_ROUTER_BUY_PRESSURE
         },
-        "note":"Profit targets are not hard caps when unlimited_profit is enabled; profitability is not guaranteed."
+        "note":"PAPER objective only; profitability is not guaranteed."
     }
 
 async def pumpportal_realtime_loop():
@@ -4978,7 +4962,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.8.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.8.3"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -5040,7 +5024,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.8.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.8.3"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5078,22 +5062,18 @@ async def position_watch_loop():
 
 def today_guard_status():
     realized=today_realized()
-    open_pnl=global_open_pnl()
-    combined=realized+open_pnl
     limit=-(f("start_balance")*f("daily_loss_limit_pct")/100)
     return {
         "today_pnl":realized,
-        "open_pnl":open_pnl,
-        "combined_pnl":combined,
         "loss_limit_usd":limit,
-        "blocked":combined<=limit,
-        "remaining_before_guard":max(0,combined-limit) if combined>limit else 0
+        "blocked":realized<=limit,
+        "remaining_before_guard":max(0,realized-limit) if realized>limit else 0
     }
 
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.3"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -5192,18 +5172,6 @@ async def startup():
         setv("launch_max_active_watch","8")
         setv("launch_watch_ttl_sec","15")
         setv("security_scan_top_n","2")
-    # Apply the requested Micro-Profit profile once to existing databases.
-    # The migration is versioned so later restarts do not overwrite user changes.
-    if getv("micro_profit_profile_version", "") != MICRO_PROFILE_VERSION:
-        setv("risk_pct", "0.35")
-        setv("daily_loss_limit_pct", "10")
-        setv("daily_target_lock_enabled", "false")
-        setv("no_martingale", "true")
-        setv("micro_profit_profile_version", MICRO_PROFILE_VERSION)
-        record_event("INFO", "MICRO_PROFIT_PROFILE_APPLIED",
-                     "Micro-Profit compounding profile applied",
-                     {"risk_pct":0.35,"daily_loss_limit_pct":10,
-                      "unlimited_profit":MICRO_UNLIMITED_PROFIT}, dedupe_sec=5)
     if today_realized() < f("start_balance")*f("daily_profit_target_pct")/100:
         runtime["daily_target_locked"]=False
         runtime["daily_target_lock_time"]=None
@@ -5455,11 +5423,23 @@ def health():
         "pumpportal_key_present":bool(PUMPPORTAL_API_KEY),
         "pumpportal_key_length":len(PUMPPORTAL_API_KEY),
         "pumpportal_stream_enabled":bool(PUMPPORTAL_TRADE_STREAM_ENABLED),
+        "live_execution_locked":LIVE_EXECUTION_LOCKED,
+        "admin_key_configured":ADMIN_KEY_CONFIGURED,
+        "cors_enabled":True
+    }
+
+@app.get("/api/auth-check")
+def auth_check(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
+    auth(x_nova_key)
+    return {
+        "ok":True,
+        "authenticated":True,
+        "version":APP_VERSION,
         "live_execution_locked":LIVE_EXECUTION_LOCKED
     }
 
 @app.get("/api/dashboard")
-def dashboard(x_nova_key:Optional[str]=Header(None)):
+def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     with SessionLocal() as s:
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
@@ -5679,8 +5659,7 @@ def system_status():
             "live_execution_locked":LIVE_EXECUTION_LOCKED}
 
 @app.get("/api/diagnostics/pumpportal")
-def pumpportal_diagnostics(x_nova_key:Optional[str]=Header(None)):
-    auth(x_nova_key)
+def pumpportal_diagnostics():
     raw=os.getenv("PUMPPORTAL_API_KEY","")
     stripped=raw.strip()
 
@@ -5753,11 +5732,11 @@ def security():
     return token_security_status()
 
 @app.post("/api/security/rescan/{mint}")
-async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
+async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.3"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -5797,7 +5776,7 @@ def engines():
     }
 
 @app.post("/api/engines/{engine_name}/{state}")
-def set_engine_control(engine_name:str,state:str,x_nova_key:Optional[str]=Header(None)):
+def set_engine_control(engine_name:str,state:str,x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     name=engine_name.strip().lower()
     key=ENGINE_CONTROL_KEYS.get(name)
@@ -5831,7 +5810,7 @@ def set_engine_control(engine_name:str,state:str,x_nova_key:Optional[str]=Header
     }
 
 @app.post("/api/mode/{mode}")
-def set_mode(mode:str, x_nova_key:Optional[str]=Header(None)):
+def set_mode(mode:str, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     requested=mode.upper().strip()
     if requested=="LIVE":
@@ -5851,7 +5830,7 @@ def execution():
     return execution_stats()
 
 @app.post("/api/execution/estimate")
-def execution_estimate(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
+def execution_estimate(data:WatchIn, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==data.mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
@@ -5867,7 +5846,7 @@ def portfolio():
     return portfolio_status()
 
 @app.post("/api/research/run")
-def run_research(x_nova_key:Optional[str]=Header(None)):
+def run_research(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     return research_report()
 
@@ -5880,11 +5859,8 @@ def optimizer():
     return adaptive_status()
 
 @app.post("/api/control/{action}")
-def control(action:str, x_nova_key:Optional[str]=Header(None)):
+def control(action:str, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
-    action=action.strip().lower()
-    if action not in {"start", "stop", "kill", "reset-paper"}:
-        raise HTTPException(400,"Unknown action")
     if action=="start":
         setv("killed","false");setv("bot_enabled","true")
         record_event("INFO","BOT_START","Auto Trader started",{"mode":operating_mode()},dedupe_sec=5)
@@ -5900,23 +5876,21 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
         runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["router_soft_entry_times"].clear();runtime["router_last_entry"]=None;runtime["router_soft_entries"]=0;runtime["launch_watch"].clear();runtime["launch_marks"].clear();runtime["launch_confirmations"].clear();runtime["launch_evaluating"].clear();runtime["launch_creator_history"].clear();runtime["launch_symbol_history"].clear();runtime["launch_entries"]=0;runtime["launch_entry_times"].clear();runtime["launch_new_tokens"]=0;runtime["launch_trades_seen"]=0;runtime["launch_diag"].clear();runtime["launch_best"]=None;runtime["launch_last_event"]=0;runtime["launch_last_entry"]=None;runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
+    else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
 
 @app.post("/api/settings")
-def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
+def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     vals=data.model_dump(exclude_none=True)
-    for name, value in vals.items():
-        if isinstance(value, (float, int)) and not math.isfinite(float(value)):
-            raise HTTPException(400, f"{name} must be finite")
-    if "risk_pct" in vals and not (0.05<=vals["risk_pct"]<=0.50):
-        raise HTTPException(400,"micro-profit risk_pct must be between 0.05 and 0.50")
+    if "risk_pct" in vals and not (0.05<=vals["risk_pct"]<=2.0):
+        raise HTTPException(400,"risk_pct must be between 0.05 and 2.0")
     if "perp_leverage" in vals and not (1.0<=vals["perp_leverage"]<=2.0):
         raise HTTPException(400,"perp_leverage must be between 1x and 2x")
     if "max_positions" in vals and not (1<=vals["max_positions"]<=10):
         raise HTTPException(400,"max_positions must be 1..10")
-    if "stop_loss_pct" in vals and not (0.5<=vals["stop_loss_pct"]<=10):
-        raise HTTPException(400,"stop_loss_pct must be 0.5..10")
+    if "stop_loss_pct" in vals and not (0.5<=vals["stop_loss_pct"]<=15):
+        raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
     if "launch_min_score" in vals and not (65<=vals["launch_min_score"]<=90):
@@ -5949,8 +5923,6 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"pulse_min_events_5s must be 2..30")
     if "daily_profit_target_pct" in vals and not (1<=vals["daily_profit_target_pct"]<=25):
         raise HTTPException(400,"daily_profit_target_pct must be 1..25")
-    if "daily_loss_limit_pct" in vals and not (0.1<=vals["daily_loss_limit_pct"]<=10):
-        raise HTTPException(400,"daily_loss_limit_pct must be 0.1..10")
     if "daily_de_risk_start_pct" in vals and not (0.5<=vals["daily_de_risk_start_pct"]<=20):
         raise HTTPException(400,"daily_de_risk_start_pct must be 0.5..20")
     if "daily_de_risk_multiplier" in vals and not (0.1<=vals["daily_de_risk_multiplier"]<=1.0):
@@ -5972,7 +5944,7 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
     return {"ok":True,"updated":list(vals.keys())}
 
 @app.post("/api/watch")
-def watch(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
+def watch(data:WatchIn, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     mint=data.mint.strip()
     if len(mint)<30:raise HTTPException(400,"Invalid mint")
@@ -5982,7 +5954,7 @@ def watch(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
     return {"ok":True}
 
 @app.post("/api/watch/remove")
-def watch_remove(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
+def watch_remove(data:WatchIn, x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
     mint=data.mint.strip()
     vals=[x for x in getv("watchlist","").split(",") if x and x!=mint]
