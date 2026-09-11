@@ -71,6 +71,22 @@ Expected:
 GET /health
 version = 6.8.2
 
+SECURITY CONFIGURATION
+----------------------
+Set these deployment secrets before starting the service:
+
+- `NOVA_ADMIN_KEY`: a long random secret. There is no fallback/default key.
+- `NOVA_ALLOWED_ORIGINS`: comma-separated HTTPS origin(s) serving the dashboard.
+
+The dashboard keeps the admin key in memory only; it is not stored in
+localStorage or sessionStorage. Protected dashboard and management endpoints
+require the `X-NOVA-Key` header. Do not place real API keys, wallet private
+keys, seed phrases, database passwords, or tokens in the repository.
+
+If `NOVA_ADMIN_KEY` is missing, protected operations intentionally return 503
+instead of accepting an insecure default. `NOVA_ALLOWED_ORIGINS` must be set
+to the exact dashboard origin; wildcard CORS is not used.
+
 GET /api/engines
 returns current control state.
 

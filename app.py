@@ -1,11 +1,11 @@
-import os, asyncio, math, time, random, json
+import os, asyncio, math, time, random, json, hmac
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote
 import httpx
 import websockets
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
@@ -80,7 +80,16 @@ PERP_UNIVERSE = {
     "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": {"market": "BTC-PERP", "symbol": "BTC"},
     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": {"market": "ETH-PERP", "symbol": "ETH"},
 }
-ADMIN_KEY = os.getenv("NOVA_ADMIN_KEY", "change-me-now")
+ADMIN_KEY = os.getenv("NOVA_ADMIN_KEY", "").strip()
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("NOVA_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if not ADMIN_KEY:
+    # Fail closed for every protected operation. The service can still answer
+    # health checks, but it must not accept an implicit/default admin key.
+    print("WARNING: NOVA_ADMIN_KEY is not configured; protected API calls are disabled")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nova_trader.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -512,11 +521,26 @@ def engine_controls_status():
 app = FastAPI(title="NOVA Trader Cloud", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-NOVA-Key", "X-Requested-With"],
 )
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 runtime = {
     "candidates": [],
@@ -643,7 +667,9 @@ position_manage_lock = asyncio.Lock()
 entry_lock = asyncio.Lock()
 
 def auth(x_nova_key: Optional[str]):
-    if not x_nova_key or x_nova_key != ADMIN_KEY:
+    if not ADMIN_KEY:
+        raise HTTPException(503, "Admin authentication is not configured")
+    if not x_nova_key or not hmac.compare_digest(x_nova_key, ADMIN_KEY):
         raise HTTPException(401, "Invalid NOVA admin key")
 
 def nz(v, d=0.0):
@@ -4403,8 +4429,8 @@ async def _cost_balance():
 def _cost_block():
     _cost_roll()
     if not b("paid_trade_stream_enabled"):return "manual_off"
-    b=runtime.get("metered_wallet_balance")
-    if b is not None and nz(b)<=METERED_FLOOR:return "wallet_floor"
+    wallet_balance=runtime.get("metered_wallet_balance")
+    if wallet_balance is not None and nz(wallet_balance)<=METERED_FLOOR:return "wallet_floor"
     if int(runtime.get("metered_events_h",0))>=METERED_MAX_EVENTS_H:return "hourly_budget"
     if int(runtime.get("metered_subs_min",0))>=METERED_MAX_SUBS_MIN:return "subscription_rate"
     if runtime.get("ws_subscription_blocked_until",0)>time.time():return "provider_breaker"
@@ -4445,7 +4471,7 @@ async def cost_sync_pulse_subscriptions(ws):
         await asyncio.sleep(1.25)
 
 def metered_cost_status():
-    _cost_roll();e=int(runtime.get("metered_events_h",0));b=runtime.get("metered_wallet_balance")
+    _cost_roll();e=int(runtime.get("metered_events_h",0));wallet_balance=runtime.get("metered_wallet_balance")
     return {"enabled":METERED_OPT,"manual_stream_enabled":b("paid_trade_stream_enabled"),"state":runtime.get("metered_state"),
       "active_paid_subscriptions":len(runtime.get("pulse_subscribed",set())),"active_cap":_cost_cap(),
       "token_ttl_sec":METERED_TTL,"new_subscriptions_this_minute":runtime.get("metered_subs_min",0),
@@ -4453,7 +4479,7 @@ def metered_cost_status():
       "events_per_hour_limit":METERED_MAX_EVENTS_H,"hour_budget_pct":round(e/max(METERED_MAX_EVENTS_H,1)*100,1),
       "events_remaining_this_hour":max(0,METERED_MAX_EVENTS_H-e),
       "estimated_session_spend_sol":round(runtime.get("metered_events_total",0)/10000*METERED_RATE,8),
-      "wallet_monitor_configured":bool(PUMPPORTAL_PUBLIC_WALLET),"wallet_balance_sol":b,
+      "wallet_monitor_configured":bool(PUMPPORTAL_PUBLIC_WALLET),"wallet_balance_sol":wallet_balance,
       "wallet_floor_sol":METERED_FLOOR,"wallet_error":runtime.get("metered_wallet_error"),
       "pruned_subscriptions":runtime.get("metered_pruned",0),"skipped_new_tokens":runtime.get("metered_skipped",0),
       "block_reason":_cost_block()}
@@ -5402,7 +5428,8 @@ def health():
     }
 
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
     with SessionLocal() as s:
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
     return {
@@ -5621,7 +5648,8 @@ def system_status():
             "live_execution_locked":LIVE_EXECUTION_LOCKED}
 
 @app.get("/api/diagnostics/pumpportal")
-def pumpportal_diagnostics():
+def pumpportal_diagnostics(x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
     raw=os.getenv("PUMPPORTAL_API_KEY","")
     stripped=raw.strip()
 
@@ -5823,6 +5851,9 @@ def optimizer():
 @app.post("/api/control/{action}")
 def control(action:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
+    action=action.strip().lower()
+    if action not in {"start", "stop", "kill", "reset-paper"}:
+        raise HTTPException(400,"Unknown action")
     if action=="start":
         setv("killed","false");setv("bot_enabled","true")
         record_event("INFO","BOT_START","Auto Trader started",{"mode":operating_mode()},dedupe_sec=5)
@@ -5838,13 +5869,15 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
         runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["router_soft_entry_times"].clear();runtime["router_last_entry"]=None;runtime["router_soft_entries"]=0;runtime["launch_watch"].clear();runtime["launch_marks"].clear();runtime["launch_confirmations"].clear();runtime["launch_evaluating"].clear();runtime["launch_creator_history"].clear();runtime["launch_symbol_history"].clear();runtime["launch_entries"]=0;runtime["launch_entry_times"].clear();runtime["launch_new_tokens"]=0;runtime["launch_trades_seen"]=0;runtime["launch_diag"].clear();runtime["launch_best"]=None;runtime["launch_last_event"]=0;runtime["launch_last_entry"]=None;runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
-    else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
 
 @app.post("/api/settings")
 def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     vals=data.model_dump(exclude_none=True)
+    for name, value in vals.items():
+        if isinstance(value, (float, int)) and not math.isfinite(float(value)):
+            raise HTTPException(400, f"{name} must be finite")
     if "risk_pct" in vals and not (0.05<=vals["risk_pct"]<=2.0):
         raise HTTPException(400,"risk_pct must be between 0.05 and 2.0")
     if "perp_leverage" in vals and not (1.0<=vals["perp_leverage"]<=2.0):
