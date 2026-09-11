@@ -1,0 +1,76 @@
+NOVA TRADER V7.0.0 — UNIVERSAL MULTI-MARKET ENGINE
+====================================================
+
+هدف نسخه:
+- کشف پویا به‌جای لیست ثابت چند کوین.
+- Major / Alt / Meme / New Tokens / Spot / Perpetual.
+- LONG و SHORT برای بازارهایی که Perpetual دارند.
+- PAPER / SHADOW باقی می‌ماند و LIVE execution همچنان HARD-LOCKED است.
+
+Providerهای V7:
+1) PumpPortal: realtime Solana launches / BUY / SELL / migration.
+2) DexScreener: multi-chain token discovery + DEX pair data.
+3) Binance Spot: universe پویا از بازارهای Spot قابل معامله.
+4) Binance USD-M Futures: universe پویا از قراردادهای Perpetual.
+5) Velocity: perp intelligence قبلی همچنان فعال است.
+
+نکته مهم درباره «تمام کریپتوها»:
+V7 هر بازاری را که Providerهای متصل expose کنند به‌صورت پویا discover می‌کند؛
+نیازی نیست BTC/ETH/PEPE/... را داخل کد دستی اضافه کنیم.
+اما هیچ سیستم واقعی نمی‌تواند توکن‌های ناشناخته‌ای را که هیچ data provider یا venue نمایش نمی‌دهد معامله کند.
+همچنین Universe کشف‌شده ممکن است بزرگ باشد و فقط بهترین/پرنقدشونده‌ترین بخش آن در هر loop فعالانه score شود تا rate-limit و RAM کنترل شود.
+
+DEPLOY BACKEND در Northflank
+---------------------------
+1) app.py فعلی را با app.py این پکیج جایگزین کن.
+2) requirements.txt را جایگزین/تأیید کن.
+3) Start command همان باشد:
+   uvicorn app:app --host 0.0.0.0 --port $PORT
+4) Health path:
+   /health
+5) Environmentهای قبلی را حذف نکن: DATABASE_URL, NOVA_ADMIN_KEY, PUMPPORTAL_API_KEY و ...
+6) Redeploy کن.
+7) /health باید version = 7.0.0 بدهد.
+
+DEPLOY DASHBOARD در GitHub Pages
+-------------------------------
+index.html را جایگزین کن و commit/push کن.
+صفحه باید NOVA TRADER V7.0.0 را نشان دهد.
+
+ENV های جدید اختیاری
+--------------------
+NOVA_UNIVERSE_REFRESH_SEC=120
+NOVA_EXCHANGE_REFRESH_SEC=900
+NOVA_CEX_PERP_SCAN_CAP=180
+NOVA_CEX_SPOT_SCAN_CAP=140
+NOVA_DEX_SCAN_CAP=120
+NOVA_MIN_CEX_QUOTE_VOLUME_24H=2000000
+NOVA_UNIVERSE_MIN_DEX_LIQUIDITY=10000
+NOVA_BINANCE_SPOT_ENABLED=true
+NOVA_BINANCE_FUTURES_ENABLED=true
+NOVA_DEX_MULTI_CHAIN_ENABLED=true
+NOVA_DEX_CHAINS=solana,ethereum,base,bsc,arbitrum,polygon,avalanche,sui
+
+برای شروع همین defaultها پیشنهاد می‌شود؛ اول Performance و Error rate را در Northflank ببین.
+
+SECURITY / RISK
+---------------
+- Solana contract scan همان RPC security scanner قبلی را دارد.
+- CEX-listed markets با CEX_LISTING علامت می‌خورند؛ این به معنی تضمین امنیت پروژه نیست.
+- Chainهای غیر-Solana فعلاً contract-security audit اختصاصی ندارند؛ در PAPER قابل مشاهده/آزمون هستند،
+  ولی NOVA ادعا نمی‌کند contract آنها audit شده است.
+- Tokenهای کم‌نقدشونده، سیگنال ضعیف، funding افراطی، volatility افراطی و risk guards می‌توانند BLOCK شوند.
+- Short فقط در marketهایی ممکن است که Provider قرارداد Perpetual ارائه کند.
+- LIVE_EXECUTION_LOCKED = True باقی مانده است.
+
+تست سریع بعد Deploy
+-------------------
+/health
+=> version 7.0.0
+
+Dashboard:
+CONNECTED / RUNNING
+Universal Market Universe
+CEX PERPS / CEX SPOT / DEX RECENT / LONG-SHORT counts
+
+اگر یکی از Providerها در منطقه/سرور Block باشد، V7 با Providerهای دیگر ادامه می‌دهد و Dashboard حالت PARTIAL نشان می‌دهد.

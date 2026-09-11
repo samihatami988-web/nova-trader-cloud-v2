@@ -11,12 +11,34 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.8.3"
+APP_VERSION = "7.0.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 LIVE_EXECUTION_LOCKED = True
 FREE_LITE = os.getenv("NOVA_FREE_LITE","true").lower() in ("1","true","yes","on")
+
+# NOVA V7 Universal Multi-Market Universe.
+# Public-market adapters are read-only and remain PAPER/SHADOW only; LIVE execution stays hard-locked.
+BINANCE_SPOT_BASE = os.getenv("NOVA_BINANCE_SPOT_BASE", "https://api.binance.com").rstrip("/")
+BINANCE_FUTURES_BASE = os.getenv("NOVA_BINANCE_FUTURES_BASE", "https://fapi.binance.com").rstrip("/")
+UNIVERSE_REFRESH_SEC = max(30, min(900, int(float(os.getenv("NOVA_UNIVERSE_REFRESH_SEC", "120")))))
+UNIVERSE_EXCHANGE_REFRESH_SEC = max(300, min(3600, int(float(os.getenv("NOVA_EXCHANGE_REFRESH_SEC", "900")))))
+UNIVERSE_CEX_PERP_CAP = max(20, min(500, int(float(os.getenv("NOVA_CEX_PERP_SCAN_CAP", "180")))))
+UNIVERSE_CEX_SPOT_CAP = max(20, min(500, int(float(os.getenv("NOVA_CEX_SPOT_SCAN_CAP", "140")))))
+UNIVERSE_DEX_CAP = max(20, min(300, int(float(os.getenv("NOVA_DEX_SCAN_CAP", "120")))))
+UNIVERSE_MIN_CEX_QUOTE_VOLUME = max(100000.0, float(os.getenv("NOVA_MIN_CEX_QUOTE_VOLUME_24H", "2000000")))
+UNIVERSE_MIN_DEX_LIQUIDITY = max(1000.0, float(os.getenv("NOVA_UNIVERSE_MIN_DEX_LIQUIDITY", "10000")))
+BINANCE_SPOT_ENABLED = os.getenv("NOVA_BINANCE_SPOT_ENABLED", "true").lower() in ("1","true","yes","on")
+BINANCE_FUTURES_ENABLED = os.getenv("NOVA_BINANCE_FUTURES_ENABLED", "true").lower() in ("1","true","yes","on")
+DEX_MULTI_CHAIN_ENABLED = os.getenv("NOVA_DEX_MULTI_CHAIN_ENABLED", "true").lower() in ("1","true","yes","on")
+UNIVERSE_DEX_CHAINS = {x.strip().lower() for x in os.getenv(
+    "NOVA_DEX_CHAINS",
+    "solana,ethereum,base,bsc,arbitrum,polygon,avalanche,sui"
+).split(",") if x.strip()}
+TRUSTED_PERP_SOURCES = {"VELOCITY", "BINANCE_FUTURES"}
+MAJOR_ASSETS = {"BTC","ETH","SOL","BNB","XRP","ADA","DOGE","AVAX","LINK","SUI","TRX","TON","DOT","LTC","BCH","APT","NEAR","ATOM","UNI","AAVE"}
+MEME_ASSETS = {"DOGE","SHIB","PEPE","BONK","WIF","FLOKI","BOME","BRETT","MOG","TURBO","NEIRO","POPCAT","PNUT","MEME"}
 
 PUMPPORTAL_API_KEY_RAW = os.getenv("PUMPPORTAL_API_KEY","")
 PUMPPORTAL_API_KEY = PUMPPORTAL_API_KEY_RAW.strip()
@@ -653,6 +675,23 @@ runtime = {
     "loop_alive": False,
 }
 
+# Dynamic universe state is kept outside persistent DB settings so a deploy can safely rebuild it.
+runtime.update({
+    "universe_last_refresh": None,
+    "universe_dex_discovered": 0,
+    "universe_cex_perp_discovered": 0,
+    "universe_cex_spot_discovered": 0,
+    "universe_chains": {},
+    "universe_provider_errors": {},
+    "binance_futures_ok": False,
+    "binance_spot_ok": False,
+    "binance_futures_exchange": {},
+    "binance_spot_exchange": {},
+    "binance_futures_exchange_ts": 0.0,
+    "binance_spot_exchange_ts": 0.0,
+    "universal_dex_assets": [],
+})
+
 position_manage_lock = asyncio.Lock()
 entry_lock = asyncio.Lock()
 
@@ -729,6 +768,15 @@ async def solana_rpc(client,method,params):
 async def scan_token_security(client,c,force=False):
     if c.get("perp_eligible"):
         return {"status":"N/A","score":100,"hard_block":False,"flags":[],"source":"PERP_MARKET"}
+    chain=str(c.get("chain_id") or "solana").lower()
+    if chain=="cex" or str(c.get("data_source") or "").startswith("BINANCE_"):
+        return {"status":"N/A","score":100,"hard_block":False,"flags":["centralized venue listing"],"source":"CEX_LISTING"}
+    if chain!="solana":
+        return {
+            "status":"UNKNOWN","score":None,"hard_block":False,
+            "flags":[f"{chain} contract scanner not connected; PAPER only unless separately verified"],
+            "source":"CHAIN_SCANNER_PENDING","note":"NOVA discovered the market but did not claim a contract-security audit."
+        }
     mint=str(c.get("mint") or "")
     cached=runtime["token_security"].get(mint)
     ttl=i("security_scan_ttl_sec")
@@ -834,9 +882,9 @@ def source_health():
         status="CRITICAL";reasons.append("market data stale")
     elif runtime.get("engine_error_streak",0)>0:
         status="WARN";reasons.append("recent engine errors")
-    if not runtime.get("velocity_source_ok"):
+    if not (runtime.get("velocity_source_ok") or runtime.get("binance_futures_ok")):
         if status=="OK":status="WARN"
-        reasons.append("primary perp source unavailable; fallback may be active")
+        reasons.append("primary perp sources unavailable; fallback may be active")
     return {
         "status":status,"reasons":reasons,
         "loop_alive":runtime.get("loop_alive",False),
@@ -1243,6 +1291,240 @@ async def fetch_legacy_perp_pairs(client):
         except Exception as e:
             runtime["last_error"]=f"perp {spec['market']}: {e}"
     return out
+
+
+def _asset_class(symbol, market_kind="SPOT"):
+    s=str(symbol or "").upper().replace("1000","")
+    if s in MEME_ASSETS:return "MEME"
+    if s in MAJOR_ASSETS:return "MAJOR"
+    return "ALT"
+
+
+def _spot_candidate_from_dex_pair(p, boost=0.0, force_chain=None):
+    if not isinstance(p,dict):return None
+    chain=str(force_chain or p.get("chainId") or "unknown").lower()
+    base=p.get("baseToken") or {}
+    address=str(base.get("address") or "")
+    if not address:return None
+    price=nz(p.get("priceUsd"))
+    if price<=0:return None
+    sc=score_pair(p,boost)
+    mint=address if chain=="solana" else f"{chain}:{address}"
+    symbol=str(base.get("symbol") or "?")
+    return {
+        "mint":mint,"token_address":address,"chain_id":chain,
+        "symbol":symbol,"name":str(base.get("name") or "Unknown"),
+        "price":price,"dex":p.get("dexId","") or "dex","url":p.get("url","") or "",
+        "perp_eligible":False,"perp_market":None,"market_kind":"DEX_SPOT",
+        "asset_class":_asset_class(symbol,"SPOT"),"data_source":"DEXSCREENER_MULTI" if chain!="solana" else "DEXSCREENER",
+        "funding_rate":0.0,"funding_bps":0.0,"oi_long_usd":0.0,"oi_short_usd":0.0,
+        "open_interest_usd":0.0,"oi_change_pct":0.0,"volatility_pct":0.0,
+        "volatility_regime":"SPOT","momentum_pct":sc.get("m5",0.0),
+        "direction":"LONG" if max(sc.get("pump_score",0),sc.get("scalp_score",0))>=f("min_pump_score") else "WAIT",
+        "direction_edge":0.0,"reasons":[],**sc
+    }
+
+
+async def discover_universal_dex(client):
+    if not DEX_MULTI_CHAIN_ENABLED:return [],{}
+    assets={};boosts={}
+    endpoints=[
+        ("/token-boosts/top/v1",True),("/token-boosts/latest/v1",True),
+        ("/token-profiles/latest/v1",False),("/community-takeovers/latest/v1",False),
+        ("/ads/latest/v1",False),
+    ]
+    for ep,boosted in endpoints:
+        try:
+            r=await client.get(DEX+ep,timeout=15);r.raise_for_status();data=r.json()
+            if isinstance(data,dict):data=[data]
+            for x in data or []:
+                chain=str(x.get("chainId") or "").lower();addr=str(x.get("tokenAddress") or "")
+                if not chain or not addr or chain=="solana":continue  # Solana already has the realtime/PumpPortal path.
+                if UNIVERSE_DEX_CHAINS and chain not in UNIVERSE_DEX_CHAINS:continue
+                key=f"{chain}:{addr}"
+                assets[key]={"chain":chain,"address":addr}
+                if boosted:boosts[key]=max(boosts.get(key,0),nz(x.get("amount"))+nz(x.get("totalAmount"))*.15)
+        except Exception as e:
+            runtime["universe_provider_errors"][f"dex:{ep}"]=str(e)[:180]
+    rows=list(assets.values())[:UNIVERSE_DEX_CAP]
+    runtime["universe_dex_discovered"]=len(assets)
+    runtime["universal_dex_assets"]=rows
+    return rows,boosts
+
+
+async def fetch_universal_dex_pairs(client, assets, boosts=None):
+    boosts=boosts or {};out=[];by_chain={}
+    for x in assets or []:
+        by_chain.setdefault(str(x.get("chain") or "").lower(),[]).append(str(x.get("address") or ""))
+    for chain,addresses in by_chain.items():
+        addresses=[a for a in dict.fromkeys(addresses) if a]
+        for k in range(0,len(addresses),30):
+            batch=addresses[k:k+30]
+            if not batch:continue
+            try:
+                r=await client.get(f"{DEX}/tokens/v1/{chain}/"+",".join(batch),timeout=20);r.raise_for_status();raw=r.json() or []
+                best={}
+                for p in raw:
+                    addr=str((p.get("baseToken") or {}).get("address") or "")
+                    if not addr:continue
+                    if addr not in best or nz((p.get("liquidity") or {}).get("usd"))>nz((best[addr].get("liquidity") or {}).get("usd")):best[addr]=p
+                for addr,p in best.items():
+                    c=_spot_candidate_from_dex_pair(p,boosts.get(f"{chain}:{addr}",0),chain)
+                    if c and nz(c.get("liquidity"))>=UNIVERSE_MIN_DEX_LIQUIDITY:out.append(c)
+            except Exception as e:
+                runtime["universe_provider_errors"][f"dex-pairs:{chain}"]=str(e)[:180]
+    out.sort(key=lambda c:max(nz(c.get("pump_score")),nz(c.get("scalp_score"))),reverse=True)
+    return out[:UNIVERSE_DEX_CAP]
+
+
+async def fetch_tagged_dex_positions(client, tagged_mints):
+    assets=[]
+    for mint in tagged_mints or []:
+        text=str(mint)
+        if ":" not in text:continue
+        chain,addr=text.split(":",1)
+        if chain in ("binances","binancef","velocity"):continue
+        if chain and addr:assets.append({"chain":chain,"address":addr})
+    return await fetch_universal_dex_pairs(client,assets,{}) if assets else []
+
+
+async def _binance_exchange_info(client, futures=True):
+    kind="futures" if futures else "spot";now=time.time();cache_key=f"binance_{kind}_exchange";ts_key=f"binance_{kind}_exchange_ts"
+    cached=runtime.get(cache_key) or {}
+    if cached and now-nz(runtime.get(ts_key))<UNIVERSE_EXCHANGE_REFRESH_SEC:return cached
+    base=BINANCE_FUTURES_BASE if futures else BINANCE_SPOT_BASE
+    path="/fapi/v1/exchangeInfo" if futures else "/api/v3/exchangeInfo"
+    try:
+        r=await client.get(base+path,timeout=20);r.raise_for_status();body=r.json() or {};mapping={}
+        for x in body.get("symbols") or []:
+            status=str(x.get("status") or "").upper()
+            if status!="TRADING":continue
+            if futures and str(x.get("contractType") or "").upper()!="PERPETUAL":continue
+            quote=str(x.get("quoteAsset") or "").upper()
+            if quote not in ("USDT","USDC"):continue
+            mapping[str(x.get("symbol") or "")]=x
+        runtime[cache_key]=mapping;runtime[ts_key]=now
+        if futures:runtime["universe_cex_perp_discovered"]=len(mapping)
+        else:runtime["universe_cex_spot_discovered"]=len(mapping)
+        return mapping
+    except Exception as e:
+        runtime["universe_provider_errors"][f"binance-{kind}-exchange"]=str(e)[:180]
+        return cached
+
+
+def _binance_perp_candidate(info,ticker,premium):
+    symbol=str(ticker.get("symbol") or "");base_asset=str(info.get("baseAsset") or symbol).upper();price=nz((premium or {}).get("markPrice"),nz(ticker.get("lastPrice")))
+    if price<=0:return None
+    quote_volume=nz(ticker.get("quoteVolume"));h24=nz(ticker.get("priceChangePercent"));funding=normalize_funding_rate((premium or {}).get("lastFundingRate"))
+    vf=volatility_features("BINANCEF:"+symbol,price);momentum=nz(vf.get("momentum_pct"))
+    mom_score=clamp(50+momentum*8,0,100);h24_score=clamp(50+h24*2.2,0,100)
+    volume_score=clamp(35+14*math.log10(max(quote_volume,1)/1000000+1),25,100)
+    funding_bps=funding*10000;fund_long=clamp(50-funding_bps*4,20,80);fund_short=clamp(50+funding_bps*4,20,80)
+    long_score=round(mom_score*.46+h24_score*.20+fund_long*.14+volume_score*.20)
+    short_score=round((100-mom_score)*.46+(100-h24_score)*.20+fund_short*.14+volume_score*.20)
+    if vf.get("regime")=="EXTREME":long_score-=5;short_score-=5
+    edge=abs(long_score-short_score);direction="WAIT" if edge<4 else ("LONG" if long_score>short_score else "SHORT")
+    return {
+        "mint":"binancef:"+symbol,"symbol":base_asset,"name":f"{base_asset}/{info.get('quoteAsset','USDT')} PERP",
+        "price":price,"dex":"binance-futures","url":"https://www.binance.com/en/futures/"+symbol,
+        "perp_eligible":True,"perp_market":symbol,"market_kind":"PERP","chain_id":"cex",
+        "asset_class":_asset_class(base_asset,"PERP"),"data_source":"BINANCE_FUTURES",
+        "funding_rate":funding,"funding_bps":round(funding_bps,4),"oi_long_usd":0.0,"oi_short_usd":0.0,"open_interest_usd":0.0,"oi_change_pct":0.0,
+        "quote_volume_24h":round(quote_volume,2),"volatility_pct":vf.get("volatility_pct",0),"volatility_regime":vf.get("regime","WARMUP"),
+        "momentum_pct":momentum,"long_score":clamp(long_score,0,100),"short_score":clamp(short_score,0,100),
+        "direction":direction,"direction_edge":round(edge,1),"reasons":["dynamic_cex_universe"],
+        "pump_score":0,"scalp_score":0,"market_risk":round(volume_score),"buy_pressure":50.0,"volume_accel":round(volume_score,1),
+        "m5":round(momentum,3),"h1":0.0,"h6":0.0,"h24":h24,"liquidity":0.0,"market_cap":0.0,"age_minutes":999999,
+    }
+
+
+async def fetch_binance_perp_markets(client, only_symbols=None):
+    if not BINANCE_FUTURES_ENABLED:return []
+    info=await _binance_exchange_info(client,True)
+    if not info:return []
+    try:
+        tr=await client.get(BINANCE_FUTURES_BASE+"/fapi/v1/ticker/24hr",timeout=20);tr.raise_for_status();tickers=tr.json() or []
+        pr=await client.get(BINANCE_FUTURES_BASE+"/fapi/v1/premiumIndex",timeout=20);pr.raise_for_status();prem=pr.json() or []
+        prem_map={str(x.get("symbol") or ""):x for x in prem if isinstance(x,dict)}
+        only=set(only_symbols or [])
+        rows=[]
+        for t in tickers:
+            sym=str(t.get("symbol") or "")
+            if sym not in info or (only and sym not in only):continue
+            qv=nz(t.get("quoteVolume"))
+            if not only and qv<UNIVERSE_MIN_CEX_QUOTE_VOLUME:continue
+            c=_binance_perp_candidate(info[sym],t,prem_map.get(sym,{}))
+            if c:rows.append(c)
+        rows.sort(key=lambda c:(nz(c.get("quote_volume_24h")),max(nz(c.get("long_score")),nz(c.get("short_score")))),reverse=True)
+        runtime["binance_futures_ok"]=True;runtime.pop("universe_provider_errors",None) if False else None
+        return rows if only else rows[:UNIVERSE_CEX_PERP_CAP]
+    except Exception as e:
+        runtime["binance_futures_ok"]=False;runtime["universe_provider_errors"]["binance-futures-market"]=str(e)[:180];return []
+
+
+def _binance_spot_candidate(info,ticker):
+    symbol=str(ticker.get("symbol") or "");base_asset=str(info.get("baseAsset") or symbol).upper();price=nz(ticker.get("lastPrice"));qv=nz(ticker.get("quoteVolume"));h24=nz(ticker.get("priceChangePercent"))
+    if price<=0:return None
+    vf=volatility_features("BINANCES:"+symbol,price);momentum=nz(vf.get("momentum_pct"));mom=clamp(50+momentum*8,0,100);day=clamp(50+h24*2,0,100);volume_score=clamp(35+14*math.log10(max(qv,1)/1000000+1),25,100)
+    pump=round(mom*.46+day*.26+volume_score*.28);scalp=round(mom*.52+clamp(100-abs(h24)*3,20,100)*.18+volume_score*.30)
+    liq_proxy=max(10000.0,qv*.01)
+    return {
+        "mint":"binances:"+symbol,"symbol":base_asset,"name":f"{base_asset}/{info.get('quoteAsset','USDT')} SPOT",
+        "price":price,"dex":"binance-spot","url":"https://www.binance.com/en/trade/"+base_asset+"_"+str(info.get('quoteAsset','USDT')),
+        "perp_eligible":False,"perp_market":None,"market_kind":"CEX_SPOT","chain_id":"cex",
+        "asset_class":_asset_class(base_asset,"SPOT"),"data_source":"BINANCE_SPOT","cex_listed":True,
+        "funding_rate":0.0,"funding_bps":0.0,"oi_long_usd":0.0,"oi_short_usd":0.0,"open_interest_usd":0.0,"oi_change_pct":0.0,
+        "quote_volume_24h":round(qv,2),"volatility_pct":vf.get("volatility_pct",0),"volatility_regime":vf.get("regime","WARMUP"),"momentum_pct":momentum,
+        "direction":"LONG" if max(pump,scalp)>=f("min_scalp_score") else "WAIT","direction_edge":0.0,"reasons":["dynamic_cex_spot"],
+        "pump_score":clamp(pump,0,100),"scalp_score":clamp(scalp,0,100),"sniper_score":0,"long_score":clamp(pump,0,100),"short_score":0,
+        "market_risk":round(volume_score),"buy_pressure":50.0,"volume_accel":round(volume_score,1),"trend_score":round(day,1),"trend_alignment":"UP" if h24>0 else "DOWN",
+        "m5":round(momentum,3),"h1":0.0,"h6":0.0,"h24":h24,"liquidity":round(liq_proxy,2),"market_cap":0.0,"age_minutes":999999,"volume_m5":0,"buys_m5":0,"sells_m5":0,
+        "security":{"status":"N/A","score":100,"hard_block":False,"flags":["centralized venue listing"],"source":"CEX_LISTING"},
+    }
+
+
+async def fetch_binance_spot_markets(client, only_symbols=None):
+    if not BINANCE_SPOT_ENABLED:return []
+    info=await _binance_exchange_info(client,False)
+    if not info:return []
+    try:
+        tr=await client.get(BINANCE_SPOT_BASE+"/api/v3/ticker/24hr",timeout=20);tr.raise_for_status();tickers=tr.json() or []
+        only=set(only_symbols or []);rows=[]
+        for t in tickers:
+            sym=str(t.get("symbol") or "")
+            if sym not in info or (only and sym not in only):continue
+            qv=nz(t.get("quoteVolume"))
+            if not only and qv<UNIVERSE_MIN_CEX_QUOTE_VOLUME:continue
+            c=_binance_spot_candidate(info[sym],t)
+            if c:rows.append(c)
+        rows.sort(key=lambda c:(nz(c.get("quote_volume_24h")),max(nz(c.get("pump_score")),nz(c.get("scalp_score")))),reverse=True)
+        runtime["binance_spot_ok"]=True
+        return rows if only else rows[:UNIVERSE_CEX_SPOT_CAP]
+    except Exception as e:
+        runtime["binance_spot_ok"]=False;runtime["universe_provider_errors"]["binance-spot-market"]=str(e)[:180];return []
+
+
+def universe_status():
+    cands=list(runtime.get("candidates") or [])
+    chains={};classes={};sources={};kinds={}
+    for c in cands:
+        chain=str(c.get("chain_id") or ("perp" if c.get("perp_eligible") else "solana"));chains[chain]=chains.get(chain,0)+1
+        cl=str(c.get("asset_class") or "TOKEN");classes[cl]=classes.get(cl,0)+1
+        so=str(c.get("data_source") or "UNKNOWN");sources[so]=sources.get(so,0)+1
+        mk=str(c.get("market_kind") or ("PERP" if c.get("perp_eligible") else "SPOT"));kinds[mk]=kinds.get(mk,0)+1
+    long_n=sum(1 for c in cands if c.get("direction")=="LONG")
+    short_n=sum(1 for c in cands if c.get("direction")=="SHORT")
+    top=sorted(cands,key=lambda c:max(nz(c.get("long_score")),nz(c.get("short_score")),nz(c.get("pump_score")),nz(c.get("scalp_score"))),reverse=True)[:12]
+    return {
+        "mode":"DYNAMIC_PROVIDER_DISCOVERY","tracked":len(cands),"long_candidates":long_n,"short_candidates":short_n,
+        "cex_perp_discovered":runtime.get("universe_cex_perp_discovered",0),"cex_spot_discovered":runtime.get("universe_cex_spot_discovered",0),
+        "dex_recent_discovered":runtime.get("universe_dex_discovered",0),"chains":chains,"classes":classes,"sources":sources,"market_kinds":kinds,
+        "providers":{"velocity":bool(runtime.get("velocity_source_ok")),"binance_futures":bool(runtime.get("binance_futures_ok")),"binance_spot":bool(runtime.get("binance_spot_ok")),"pumpportal":bool(runtime.get("pulse_stream_connected")),"dexscreener":True},
+        "scan_caps":{"cex_perp":UNIVERSE_CEX_PERP_CAP,"cex_spot":UNIVERSE_CEX_SPOT_CAP,"dex":UNIVERSE_DEX_CAP},
+        "provider_errors":dict(runtime.get("universe_provider_errors") or {}),"last_refresh":runtime.get("universe_last_refresh"),
+        "top":[{"symbol":c.get("symbol"),"asset_class":c.get("asset_class"),"market_kind":c.get("market_kind"),"source":c.get("data_source"),"direction":c.get("direction"),"score":round(max(nz(c.get("long_score")),nz(c.get("short_score")),nz(c.get("pump_score")),nz(c.get("scalp_score"))),1)} for c in top]
+    }
+
 
 def strategy_side(strategy):
     return "SHORT" if str(strategy).endswith("_SHORT") else "LONG"
@@ -1653,7 +1935,7 @@ def route_quality(c,strategy,notional_usd=None):
         leverage=strategy_leverage(strategy)
         notional=max(25.0,f("start_balance")*f("max_position_pct")/100*leverage*.65)
     source=str(c.get("data_source") or "UNKNOWN")
-    source_q={"VELOCITY":95,"DEXSCREENER":88,"DEX_FALLBACK":55}.get(source,55)
+    source_q={"VELOCITY":95,"BINANCE_FUTURES":94,"BINANCE_SPOT":92,"DEXSCREENER":88,"DEXSCREENER_MULTI":84,"DEX_FALLBACK":55}.get(source,55)
     if c.get("perp_eligible"):
         age=iso_age_seconds(runtime.get("last_perp_refresh"))
     else:
@@ -1670,7 +1952,7 @@ def route_quality(c,strategy,notional_usd=None):
     max_cost=max(f("max_execution_cost_bps"),1)
     execution_q=clamp(100-est.get("all_in_bps",0)/max_cost*70,0,100)
     q=source_q*.30+freshness*.20+execution_q*.25+security_q*.25
-    venue="VELOCITY-PERP-SHADOW" if source=="VELOCITY" else "DEXSCREENER-SPOT-SHADOW" if not c.get("perp_eligible") else "PERP-FALLBACK-SHADOW"
+    venue=("VELOCITY-PERP-SHADOW" if source=="VELOCITY" else "BINANCE-PERP-PAPER" if source=="BINANCE_FUTURES" else "BINANCE-SPOT-PAPER" if source=="BINANCE_SPOT" else "DEXSCREENER-SPOT-SHADOW" if not c.get("perp_eligible") else "PERP-FALLBACK-SHADOW")
     return {
         "venue":venue,"quality":round(clamp(q,0,100),1),"source_quality":source_q,
         "freshness_quality":round(freshness,1),"execution_quality":round(execution_q,1),
@@ -1679,8 +1961,8 @@ def route_quality(c,strategy,notional_usd=None):
 
 def route_gate(c,strategy):
     route=route_quality(c,strategy)
-    if operating_mode()=="SHADOW" and c.get("perp_eligible") and c.get("data_source")!="VELOCITY":
-        return False,"shadow requires primary perp source",route
+    if operating_mode()=="SHADOW" and c.get("perp_eligible") and c.get("data_source") not in TRUSTED_PERP_SOURCES:
+        return False,"shadow requires trusted perp source",route
     if route["quality"]<f("min_route_quality"):
         return False,"route quality too low",route
     return True,"ok",route
@@ -1788,8 +2070,9 @@ def volatility_cost_multiplier(regime):
 def execution_reference_depth(c,strategy):
     if str(strategy).startswith("PERP_"):
         oi=max(nz(c.get("open_interest_usd")),0)
-        # OI is not order-book depth. This is deliberately conservative proxy depth.
-        return max(100000.0,oi*0.01)
+        qv=max(nz(c.get("quote_volume_24h")),0)
+        # OI / daily quote volume are not order-book depth. We use a deliberately conservative proxy only for PAPER execution-cost simulation.
+        return max(100000.0,oi*0.01,qv*0.001)
     return max(1000.0,nz(c.get("liquidity")))
 
 
@@ -2543,17 +2826,23 @@ def gate(c,strategy=None):
     if c.get("perp_eligible"):
         # PERP gate = OI + direction edge + funding + volatility + primary source in SHADOW.
         # The generic spot market-quality score is intentionally NOT a hard gate here.
-        if c.get("data_source")=="VELOCITY":
+        source=str(c.get("data_source") or "")
+        if source=="VELOCITY":
             if c.get("open_interest_usd",0) < f("min_perp_oi_usd"):
                 return False,"low perp open interest"
+            if c.get("direction_edge",0) < f("min_direction_edge"):
+                return False,"weak directional edge"
+        elif source=="BINANCE_FUTURES":
+            if nz(c.get("quote_volume_24h")) < UNIVERSE_MIN_CEX_QUOTE_VOLUME:
+                return False,"low perp quote volume"
             if c.get("direction_edge",0) < f("min_direction_edge"):
                 return False,"weak directional edge"
         if abs(c.get("funding_rate",0)) > f("max_abs_funding_rate"):
             return False,"extreme funding"
         if b("block_extreme_volatility") and c.get("volatility_regime")=="EXTREME":
             return False,"extreme volatility"
-        if operating_mode()=="SHADOW" and c.get("data_source")!="VELOCITY":
-            return False,"shadow requires primary perp source"
+        if operating_mode()=="SHADOW" and source not in TRUSTED_PERP_SOURCES:
+            return False,"shadow requires trusted perp source"
     else:
         # SPOT gate = liquidity + quality + security.
         # Capital Shield applies stricter floors than older persisted dashboard settings.
@@ -3870,7 +4159,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.8.3"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/7.0.0"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -4247,7 +4536,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.8.3"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/7.0.0"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -4930,13 +5219,17 @@ def open_spot_mints():
 async def fetch_open_spot_pairs(client,boosts):
     mints=open_spot_mints()
     if not mints:return []
-    # Fetch separately from scanner so open positions never disappear merely
-    # because the token drops out of discovery/top-candidate ranking.
-    rows=await fetch_pairs(client,mints,boosts)
+    # Legacy raw addresses are Solana. Tagged ids are refreshed by their provider adapters.
+    solana=[m for m in mints if ":" not in str(m)]
+    tagged_dex=[m for m in mints if ":" in str(m) and not str(m).startswith(("binances:","binancef:","velocity:"))]
+    cex_spot=[str(m).split(":",1)[1] for m in mints if str(m).startswith("binances:")]
+    rows=[]
+    if solana:rows.extend(await fetch_pairs(client,solana,boosts))
+    if tagged_dex:rows.extend(await fetch_tagged_dex_positions(client,tagged_dex))
+    if cex_spot:rows.extend(await fetch_binance_spot_markets(client,cex_spot))
     now=time.time()
     for c in rows:
-        runtime["position_price_seen"][c["mint"]]=now
-        c["position_watch"]=True
+        runtime["position_price_seen"][c["mint"]]=now;c["position_watch"]=True
     return rows
 
 
@@ -4962,7 +5255,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.8.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/7.0.0"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -5024,7 +5317,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.8.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.0.0"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5043,11 +5336,14 @@ async def position_watch_loop():
                         updates.extend(fresh_spot)
 
                     if any(str(p.strategy).startswith("PERP_") for p in positions):
+                        open_mints={p.mint for p in positions if str(p.strategy).startswith("PERP_")}
                         raw=await fetch_velocity_markets(client)
                         if raw:
                             perps=[perp_intelligence(v) for v in raw]
-                            open_mints={p.mint for p in positions if str(p.strategy).startswith("PERP_")}
                             updates.extend([c for c in perps if c["mint"] in open_mints])
+                        bin_syms=[str(m).split(":",1)[1] for m in open_mints if str(m).startswith("binancef:")]
+                        if bin_syms:
+                            updates.extend(await fetch_binance_perp_markets(client,bin_syms))
 
                     merge_position_updates(updates)
                     runtime["position_watch_error"]=None
@@ -5072,88 +5368,80 @@ def today_guard_status():
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.3"}) as client:
-        addresses=[];boosts={};last_discovery=0
+    record_event("INFO","ENGINE_START","NOVA V7 universal engine loop started",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.0.0"}) as client:
+        addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
-                now=time.time()
-                now_iso=datetime.now(timezone.utc).isoformat()
+                now=time.time();now_iso=datetime.now(timezone.utc).isoformat()
                 if now-last_discovery>60 or not addresses:
                     addresses,boosts=await discover(client);last_discovery=now
+                if now-last_universe>UNIVERSE_REFRESH_SEC or not universal_assets:
+                    universal_assets,universal_boosts=await discover_universal_dex(client);last_universe=now
 
+                # Solana meme/new-token scanner + cross-chain DEX discovery.
                 spot_pairs=await fetch_pairs(client,addresses,boosts)
+                multi_dex=await fetch_universal_dex_pairs(client,universal_assets,universal_boosts)
 
-                # CRITICAL V5.2: open spot positions are fetched independently of
-                # discovery ranking, so stop/trailing management cannot lose track
-                # of a token merely because it leaves the candidate list.
+                # Open spot positions are always refreshed independently of ranking.
                 open_spot_pairs=await fetch_open_spot_pairs(client,boosts)
                 if open_spot_pairs:
-                    by_mint={c["mint"]:c for c in spot_pairs}
+                    by_mint={c["mint"]:c for c in spot_pairs+multi_dex}
                     for c in open_spot_pairs:by_mint[c["mint"]]=c
                     spot_pairs=list(by_mint.values())
-
-                if spot_pairs:
-                    runtime["last_spot_refresh"]=now_iso
-
-                velocity_raw=await fetch_velocity_markets(client)
-                if velocity_raw:
-                    runtime["last_perp_refresh"]=now_iso
-                    perp_pairs=[perp_intelligence(v) for v in velocity_raw]
                 else:
-                    perp_pairs=await fetch_legacy_perp_pairs(client)
+                    spot_pairs=spot_pairs+multi_dex
+
+                # Dynamic CEX spot universe adds majors/alts/memes that may not exist in DEX discovery.
+                cex_spot=await fetch_binance_spot_markets(client)
+                if cex_spot:
+                    by_mint={c["mint"]:c for c in spot_pairs}
+                    for c in cex_spot:by_mint[c["mint"]]=c
+                    spot_pairs=list(by_mint.values())
+                if spot_pairs:runtime["last_spot_refresh"]=now_iso
+
+                # Perpetual universe: Velocity + dynamic Binance USD-M markets.
+                velocity_raw=await fetch_velocity_markets(client)
+                velocity_pairs=[perp_intelligence(v) for v in velocity_raw] if velocity_raw else []
+                binance_perps=await fetch_binance_perp_markets(client)
+                if velocity_pairs or binance_perps:runtime["last_perp_refresh"]=now_iso
+                if not velocity_pairs and not binance_perps:
+                    velocity_pairs=await fetch_legacy_perp_pairs(client)
 
                 merged={c["mint"]:c for c in spot_pairs}
-                for c in perp_pairs:merged[c["mint"]]=c
+                for c in velocity_pairs+binance_perps:merged[c["mint"]]=c
                 pairs=list(merged.values())
-                pairs.sort(key=lambda x:max(x["pump_score"],x["scalp_score"],x["long_score"],x["short_score"]),reverse=True)
+                pairs.sort(key=lambda x:max(nz(x.get("pump_score")),nz(x.get("scalp_score")),nz(x.get("long_score")),nz(x.get("short_score"))),reverse=True)
 
                 if pairs:
-                    # Security scans are real Solana RPC reads and cached to protect RPC limits.
-                    spot_ranked=[c for c in pairs if not c.get("perp_eligible")]
+                    # Solana contract security scan only. CEX listings are N/A; other chains are discovered but not falsely audited.
+                    spots=[c for c in pairs if not c.get("perp_eligible")]
+                    solana_spots=[c for c in spots if str(c.get("chain_id") or "solana").lower()=="solana" and not str(c.get("data_source") or "").startswith("BINANCE_")]
                     scan_n=max(1,min(12,i("security_scan_top_n")))
-                    for c in spot_ranked[:scan_n]:
-                        c["security"]=await scan_token_security(client,c)
-                    for c in spot_ranked[scan_n:]:
-                        cached=runtime["token_security"].get(c["mint"])
-                        c["security"]={k:v for k,v in cached.items() if k!="_ts"} if cached else {
-                            "status":"UNKNOWN","score":None,"hard_block":False,
-                            "flags":["not scanned in current top-N window"],"source":"SOLANA_RPC"
-                        }
+                    for c in solana_spots[:scan_n]:c["security"]=await scan_token_security(client,c)
+                    for c in spots:
+                        if c.get("security"):continue
+                        if c in solana_spots:
+                            cached=runtime["token_security"].get(c["mint"])
+                            c["security"]={k:v for k,v in cached.items() if k!="_ts"} if cached else {"status":"UNKNOWN","score":None,"hard_block":False,"flags":["not scanned in current top-N window"],"source":"SOLANA_RPC"}
+                        else:
+                            c["security"]=await scan_token_security(client,c)
                     for c in pairs:
-                        if c.get("perp_eligible"):
-                            c["security"]={"status":"N/A","score":100,"hard_block":False,"flags":[],"source":"PERP_MARKET"}
-                        st=suggested_strategy(c)
-                        signal=strategy_entry_score(st,c)
-                        quality,route=signal_quality(c,st,signal)
-                        c["best_strategy"]=st
-                        c["quality_score"]=quality
-                        c["route"]=route
-                        attach_entry_router_status(c)
+                        if c.get("perp_eligible"):c["security"]={"status":"N/A","score":100,"hard_block":False,"flags":[],"source":"PERP_MARKET"}
+                        st=suggested_strategy(c);signal=strategy_entry_score(st,c);quality,route=signal_quality(c,st,signal)
+                        c["best_strategy"]=st;c["quality_score"]=quality;c["route"]=route;attach_entry_router_status(c)
 
                     runtime["candidates"]=pairs
-                    runtime["last_refresh"]=now_iso
-                    runtime["last_successful_loop"]=now_iso
-                    runtime["engine_error_streak"]=0
-                    await manage_positions_safe()
-                    await choose_entry_safe()
-                    record_equity_snapshot()
-                    record_market_snapshots(pairs)
+                    runtime["last_refresh"]=now_iso;runtime["last_successful_loop"]=now_iso;runtime["universe_last_refresh"]=now_iso;runtime["engine_error_streak"]=0
+                    await manage_positions_safe();await choose_entry_safe();record_equity_snapshot();record_market_snapshots(pairs)
                     for c in pairs:runtime["prev_liq"][c["mint"]]=c.get("liquidity",0)
-
                     h=source_health()
-                    if h["status"]=="WARN":
-                        record_event("WARN","DATA_HEALTH","Market data health warning",h)
+                    if h["status"]=="WARN":record_event("WARN","DATA_HEALTH","Market data health warning",h)
                 else:
-                    runtime["engine_error_streak"]+=1
-                    record_event("WARN","NO_CANDIDATES","No candidates returned by market sources",{},dedupe_sec=300)
-
+                    runtime["engine_error_streak"]+=1;record_event("WARN","NO_CANDIDATES","No candidates returned by universal market sources",{},dedupe_sec=300)
                 runtime["last_error"]=None if pairs else runtime["last_error"]
             except Exception as e:
-                runtime["engine_error_streak"]+=1
-                runtime["last_error"]=str(e)
-                record_event("ERROR","ENGINE_LOOP_ERROR",str(e)[:220],
-                             {"streak":runtime["engine_error_streak"]},dedupe_sec=180)
+                runtime["engine_error_streak"]+=1;runtime["last_error"]=str(e);record_event("ERROR","ENGINE_LOOP_ERROR",str(e)[:220],{"streak":runtime["engine_error_streak"]},dedupe_sec=180)
             await asyncio.sleep(30 if FREE_LITE else 15)
 
 @app.on_event("startup")
@@ -5438,6 +5726,11 @@ def auth_check(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         "live_execution_locked":LIVE_EXECUTION_LOCKED
     }
 
+@app.get("/api/universe")
+def api_universe(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
+    auth(x_nova_key)
+    return {"version":APP_VERSION,"live_execution_locked":LIVE_EXECUTION_LOCKED,"universe":universe_status()}
+
 @app.get("/api/dashboard")
 def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
@@ -5455,6 +5748,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         },
         "mode":operating_mode(),
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
+        "universe":universe_status(),
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
         "engine_controls":engine_controls_status(),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,
@@ -5736,7 +6030,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None, alias=
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/6.8.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-FreeLite/7.0.0"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
