@@ -1,8 +1,10 @@
-# NOVA Trader V7.2.2
+# NOVA Trader V7.2.3 — Free AI Mode
 
-- Added visible OpenAI HTTP status, latency, error type/message, attempts, successes and detailed error counters.
-- Added Northflank-safe `[NOVA][OpenAI]` diagnostic log lines.
-- Fixed AI success accounting: attempts and successful analyses are now counted separately.
-- Fixed major-perp AI cache key fallback when a CEX/perp candidate has no mint.
-- Raised default OpenAI timeout to 20s while keeping calls off the meme/launch hot path.
-- Trading/risk thresholds remain unchanged from V7.2.1.
+- Added zero-cost Local Quant AI for major perpetuals.
+- Added LONG / SHORT / WAIT local confidence + regime + risk classification.
+- Added automatic OpenAI quota/credit suspension on 429 insufficient_quota / credit_balance_exhausted.
+- Prevents repeated paid-API failures after quota exhaustion.
+- OpenAI remains optional; local mode stays available with no network calls.
+- Fixed stable OpenAI cache lookup for CEX/perp candidates without mint identifiers.
+- Added free AI status to health/dashboard payload.
+- Preserved meme/launch hot path and V7.0 risk/signal core.

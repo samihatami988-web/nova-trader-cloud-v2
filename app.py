@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.2.2"
+APP_VERSION = "7.2.3"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -86,8 +86,9 @@ MAJOR_TRADER_CANDLE_WEIGHT = max(0.20, min(0.60, float(os.getenv("NOVA_MAJOR_TRA
 MAJOR_TRADER_FLOW_WEIGHT = 1.0 - MAJOR_TRADER_CANDLE_WEIGHT
 MAJOR_TRADER_MAX_ATR_PCT = max(2.0, min(15.0, float(os.getenv("NOVA_MAJOR_TRADER_MAX_ATR_PCT", "8"))))
 
-# V7.2.2 OpenAI AI Brain diagnostics + recovery. Runs asynchronously on major perpetuals only so it never
-# adds LLM latency to the meme/launch hot path. Deterministic risk guards remain final.
+# V7.2.3 Free AI Mode + OpenAI optional accelerator. Local Quant AI is always available for major perpetuals.
+# OpenAI remains optional and auto-suspends on quota/credit errors so free mode never burns failed requests.
+# No LLM latency is added to the meme/launch hot path. Deterministic risk guards remain final.
 OPENAI_AI_ENABLED = os.getenv("NOVA_OPENAI_AI_ENABLED", "true").lower() in ("1","true","yes","on")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("NOVA_OPENAI_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
@@ -99,6 +100,12 @@ OPENAI_AI_TIMEOUT_SEC = max(5.0, min(30.0, float(os.getenv("NOVA_OPENAI_AI_TIMEO
 OPENAI_AI_MAX_ADJUST = max(1.0, min(10.0, float(os.getenv("NOVA_OPENAI_AI_MAX_ADJUST", "5"))))
 OPENAI_AI_MIN_CONF = max(55.0, min(90.0, float(os.getenv("NOVA_OPENAI_AI_MIN_CONF", "68"))))
 OPENAI_AI_BLOCK_CONF = max(70.0, min(98.0, float(os.getenv("NOVA_OPENAI_AI_BLOCK_CONF", "88"))))
+
+# Free local fallback: deterministic market-regime/confidence engine, no external API cost.
+FREE_AI_MODE_ENABLED = os.getenv("NOVA_FREE_AI_MODE_ENABLED", "true").lower() in ("1","true","yes","on")
+FREE_AI_MIN_CONF = max(50.0, min(90.0, float(os.getenv("NOVA_FREE_AI_MIN_CONF", "64"))))
+FREE_AI_VETO_CONF = max(70.0, min(98.0, float(os.getenv("NOVA_FREE_AI_VETO_CONF", "90"))))
+OPENAI_AUTO_SUSPEND_QUOTA = os.getenv("NOVA_OPENAI_AUTO_SUSPEND_QUOTA", "true").lower() in ("1","true","yes","on")
 
 # V7.1.2 Global Loss Guard + Adaptive Recovery.
 # This sits above individual strategy governors: after the first global loss it de-risks and tightens entries;
@@ -653,6 +660,10 @@ runtime = {
     "openai_ai_timeout_errors": 0,
     "openai_ai_parse_errors": 0,
     "openai_ai_empty_output_errors": 0,
+    "openai_ai_suspended": False,
+    "openai_ai_suspend_reason": None,
+    "free_ai_cache": {},
+    "free_ai_last_refresh": None,
     "last_refresh": None,
     "last_error": None,
     "prev_liq": {},
@@ -1896,6 +1907,76 @@ def apply_hybrid_intelligence(pairs):
     return pairs
 
 
+def _stable_market_key(c):
+    return c.get("mint") or f"{str(c.get('data_source') or 'PERP')}:{str(c.get('symbol') or '').upper()}:{str(c.get('perp_market') or '')}"
+
+def local_quant_ai_assessment(c):
+    """Free deterministic decision layer built from NOVA's own quant + MTF context.
+    It is not an external LLM and makes no network calls.
+    """
+    if not (FREE_AI_MODE_ENABLED and c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS):
+        return None
+    ctx=c.get("hybrid_ai") or major_trader_context(c)
+    intel=c.get("candle_intelligence") or {}
+    long_score=nz(ctx.get("long_score"), nz(c.get("long_score"),50))
+    short_score=nz(ctx.get("short_score"), nz(c.get("short_score"),50))
+    edge=long_score-short_score
+    base_conf=nz(ctx.get("confidence"),0)
+    mtf_conf=nz(intel.get("confidence"),45)
+    agreement=nz(intel.get("agreement"),0)
+    atr=nz(intel.get("atr_pct"), nz(c.get("volatility_pct")))
+    confidence=clamp(base_conf*0.58 + mtf_conf*0.30 + min(abs(edge)*1.15,18) + min(agreement*3.0,8),0,100)
+    if atr>MAJOR_TRADER_MAX_ATR_PCT: confidence-=8
+    confidence=round(clamp(confidence,0,100),1)
+    if edge>=MAJOR_TRADER_MIN_EDGE and long_score>=MAJOR_TRADER_MIN_SCORE and confidence>=FREE_AI_MIN_CONF:
+        decision="LONG"
+    elif edge<=-MAJOR_TRADER_MIN_EDGE and short_score>=MAJOR_TRADER_MIN_SCORE and confidence>=FREE_AI_MIN_CONF:
+        decision="SHORT"
+    else:
+        decision="WAIT"
+    structure=str(intel.get("structure") or "UNKNOWN").upper()
+    bias=str(intel.get("bias") or "NEUTRAL").upper()
+    if atr>MAJOR_TRADER_MAX_ATR_PCT: regime="HIGH_VOLATILITY"
+    elif "HH_HL" in structure or bias=="BULLISH": regime="TREND_UP"
+    elif "LH_LL" in structure or bias=="BEARISH": regime="TREND_DOWN"
+    elif "RANGE" in structure: regime="RANGE"
+    else: regime="UNCLEAR"
+    risk="HIGH" if atr>MAJOR_TRADER_MAX_ATR_PCT else "MEDIUM" if atr>max(3.0,MAJOR_TRADER_MAX_ATR_PCT*0.55) else "LOW"
+    reasons=[f"quant L{long_score:.0f}/S{short_score:.0f} edge {edge:.0f}",f"MTF {bias} conf {mtf_conf:.0f}",f"structure {structure}"]
+    return {"provider":"LOCAL_QUANT","decision":decision,"confidence":confidence,"regime":regime,"risk":risk,
+            "long_score":round(long_score,1),"short_score":round(short_score,1),"edge":round(edge,1),"reasons":reasons,
+            "symbol":str(c.get("symbol") or "").upper(),"mint":c.get("mint"),"updated_at":datetime.now(timezone.utc).isoformat()}
+
+def refresh_free_ai_cache(pairs):
+    if not FREE_AI_MODE_ENABLED:
+        runtime["free_ai_cache"]={}; return pairs
+    cache={}
+    for c in pairs or []:
+        out=local_quant_ai_assessment(c)
+        if out:
+            key=_stable_market_key(c); cache[key]=out; c["free_ai"]=out
+    runtime["free_ai_cache"]=cache
+    runtime["free_ai_last_refresh"]=datetime.now(timezone.utc).isoformat()
+    return pairs
+
+def free_ai_confirmation_gate(c,strategy):
+    if not (FREE_AI_MODE_ENABLED and c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS):
+        return True,"not_applicable"
+    ai=c.get("free_ai") or (runtime.get("free_ai_cache") or {}).get(_stable_market_key(c)) or {}
+    if nz(ai.get("confidence"))<FREE_AI_VETO_CONF:
+        return True,"free_ai_not_strong_enough_to_veto"
+    d=str(ai.get("decision") or "WAIT")
+    if strategy=="PERP_LONG" and d=="SHORT": return False,"Free Quant AI high-confidence SHORT contradiction"
+    if strategy=="PERP_SHORT" and d=="LONG": return False,"Free Quant AI high-confidence LONG contradiction"
+    return True,"free_ai_confirmed_or_wait"
+
+def free_ai_status():
+    cache=list((runtime.get("free_ai_cache") or {}).values())
+    cache.sort(key=lambda x:nz(x.get("confidence")),reverse=True)
+    return {"enabled":FREE_AI_MODE_ENABLED,"state":"ACTIVE" if FREE_AI_MODE_ENABLED else "OFF","provider":"LOCAL_QUANT","cost":"FREE",
+            "network_calls":0,"tracked":len(cache),"last_refresh":runtime.get("free_ai_last_refresh"),
+            "top":[{"symbol":x.get("symbol"),"decision":x.get("decision"),"confidence":x.get("confidence"),"regime":x.get("regime"),"risk":x.get("risk"),"reasons":x.get("reasons")} for x in cache[:8]]}
+
 def _openai_output_text(payload):
     # Responses API returns assistant text inside output[].content[].text.
     for item in payload.get("output") or []:
@@ -2006,6 +2087,10 @@ async def _openai_analyze_major(client,c):
             code=str(err.get("code") or "")[:100]
             typ=str(err.get("type") or "")[:100]
             detail=f"status={r.status_code} type={typ or '-'} code={code or '-'} message={msg}"
+            if OPENAI_AUTO_SUSPEND_QUOTA and r.status_code==429 and (code in ("credit_balance_exhausted","insufficient_quota") or typ=="insufficient_quota"):
+                runtime["openai_ai_suspended"]=True
+                runtime["openai_ai_suspend_reason"]="NO_CREDITS"
+                runtime["openai_ai_state"]="FREE_LOCAL"
         except Exception:
             detail=f"status={r.status_code} body={r.text[:500]}"
         raise RuntimeError("OpenAI HTTP error: "+detail)
@@ -2051,8 +2136,11 @@ async def openai_ai_brain_loop():
     async with httpx.AsyncClient() as client:
         while True:
             try:
+                if runtime.get("openai_ai_suspended"):
+                    runtime["openai_ai_state"]="FREE_LOCAL"
+                    await asyncio.sleep(max(30,OPENAI_AI_REFRESH_SEC)); continue
                 if not (OPENAI_AI_ENABLED and OPENAI_API_KEY):
-                    runtime["openai_ai_state"]="DISABLED" if not OPENAI_AI_ENABLED else "NO_KEY"
+                    runtime["openai_ai_state"]="FREE_LOCAL" if FREE_AI_MODE_ENABLED else ("DISABLED" if not OPENAI_AI_ENABLED else "NO_KEY")
                     await asyncio.sleep(15); continue
                 rows=[dict(c) for c in (runtime.get("candidates") or []) if c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS]
                 rows.sort(key=lambda c:max(nz(c.get("long_score")),nz(c.get("short_score"))),reverse=True)
@@ -2114,7 +2202,7 @@ def apply_openai_ai_overlay(pairs):
     cache=runtime.get("openai_ai_cache") or {}; now=datetime.now(timezone.utc)
     for c in pairs or []:
         if not (c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS): continue
-        ai=cache.get(c.get("mint"))
+        ai=cache.get(_stable_market_key(c))
         if not ai: continue
         try:
             ts=datetime.fromisoformat(str(ai.get("updated_at"))); ts=ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
@@ -2137,7 +2225,7 @@ def apply_openai_ai_overlay(pairs):
 
 def openai_ai_confirmation_gate(c,strategy):
     # AI may veto only a very high-confidence direct contradiction on majors; it can never bypass other guards.
-    if not (OPENAI_AI_ENABLED and OPENAI_API_KEY and c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS):
+    if not (OPENAI_AI_ENABLED and OPENAI_API_KEY and not runtime.get("openai_ai_suspended") and c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS):
         return True,"not_applicable"
     ai=c.get("openai_ai") or {}
     if nz(ai.get("confidence"))<OPENAI_AI_BLOCK_CONF:return True,"ai_not_strong_enough_to_veto"
@@ -2165,7 +2253,9 @@ def openai_ai_brain_status():
         "http_errors":runtime.get("openai_ai_http_errors",0),"timeout_errors":runtime.get("openai_ai_timeout_errors",0),
         "parse_errors":runtime.get("openai_ai_parse_errors",0),"empty_output_errors":runtime.get("openai_ai_empty_output_errors",0),
         "tracked":len(cache),"decision_scope":"MAJOR_PERP_CONFIRMATION_ONLY","meme_hot_path":"NO_LLM_LATENCY",
-        "diagnostic_mode":"V7.2.2_VISIBLE_HTTP_PARSE_TIMEOUT_DIAGNOSTICS",
+        "diagnostic_mode":"V7.2.3_FREE_AI_FALLBACK_AND_QUOTA_SUSPEND",
+        "suspended":bool(runtime.get("openai_ai_suspended")),"suspend_reason":runtime.get("openai_ai_suspend_reason"),
+        "fallback_active":bool(FREE_AI_MODE_ENABLED and (runtime.get("openai_ai_suspended") or not OPENAI_API_KEY or not OPENAI_AI_ENABLED)),
         "top":[{"symbol":x.get("symbol"),"decision":x.get("decision"),"confidence":x.get("confidence"),"regime":x.get("regime"),"risk":x.get("risk"),"reasons":x.get("reasons"),"updated_at":x.get("updated_at")} for x in cache[:8]]
     }
 
@@ -6094,6 +6184,11 @@ def choose_entry():
             log_decision(c,strategy,"BLOCKED",ai_reason,signal,quality,route.get("quality",0),sec_score)
             continue
 
+        free_ok,free_reason=free_ai_confirmation_gate(c,strategy)
+        if not free_ok:
+            log_decision(c,strategy,"BLOCKED",free_reason,signal,quality,route.get("quality",0),sec_score)
+            continue
+
         trade_candidate=dict(c)
         if assessment["state"]=="SOFT_PASS":
             trade_candidate["_router_soft_pass"]=True
@@ -6347,6 +6442,7 @@ async def engine_loop():
                 # The main trading loop only consumes the latest cache, so slow Binance candles cannot stall NOVA.
                 apply_candle_overlay(pairs)
                 apply_hybrid_intelligence(pairs)
+                refresh_free_ai_cache(pairs)
                 apply_openai_ai_overlay(pairs)
                 pairs.sort(key=lambda x:max(nz(x.get("pump_score")),nz(x.get("scalp_score")),nz(x.get("long_score")),nz(x.get("short_score"))),reverse=True)
 
@@ -6634,6 +6730,8 @@ def health():
         "profit_core_version":PROFIT_CORE_VERSION,"hybrid_brain_enabled":HYBRID_BRAIN_ENABLED,
         "openai_ai_enabled":OPENAI_AI_ENABLED,"openai_ai_configured":bool(OPENAI_API_KEY),"openai_ai_model":OPENAI_MODEL,
         "openai_ai_state":runtime.get("openai_ai_state"),
+        "free_ai_enabled":FREE_AI_MODE_ENABLED,"free_ai_state":"ACTIVE" if FREE_AI_MODE_ENABLED else "OFF",
+        "openai_ai_suspended":bool(runtime.get("openai_ai_suspended")),"openai_ai_suspend_reason":runtime.get("openai_ai_suspend_reason"),
         "openai_ai_last_http_status":runtime.get("openai_ai_last_http_status"),
         "openai_ai_last_error_type":runtime.get("openai_ai_last_error_type"),
         "openai_ai_last_error":runtime.get("openai_ai_last_error"),
@@ -6717,6 +6815,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         "candle_intelligence":candle_intelligence_status(),
         "hybrid_brain":hybrid_brain_status(),
         "openai_ai_brain":openai_ai_brain_status(),
+        "free_ai_brain":free_ai_status(),
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
         "engine_controls":engine_controls_status(),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,

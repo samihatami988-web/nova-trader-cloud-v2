@@ -1,14 +1,27 @@
-# NOVA Trader V7.2.2 Test Report
+# NOVA V7.2.3 Test Report
 
-Build checks completed:
+PASS — Python syntax (`python -m py_compile app.py`)
 
-- Python syntax / bytecode compile: PASS
-- Dashboard JavaScript syntax (extracted inline script, Node `--check`): PASS
-- Module import: PASS
-- `/health` function reports version `7.2.2`: PASS
-- AI diagnostic status exposes attempts, successes, HTTP status, latency, error type/message and detailed counters: PASS
-- Stable fallback cache key exists for major-perp candidates without a mint: PASS (code-path inspection)
-- Meme/launch LLM hot path remains unchanged and asynchronous: PASS (code-path inspection)
-- Trading thresholds / Risk Guard values were not loosened by this patch.
+PASS — Dashboard JavaScript syntax (`node --check` on extracted scripts)
 
-Live OpenAI network validation requires the user's Northflank `OPENAI_API_KEY` and is intentionally not performed in this offline build environment.
+PASS — Local Quant AI smoke test
+- Mock BTC perpetual assessed as LONG from bullish quant + MTF context.
+- Local provider: `LOCAL_QUANT`
+- Free AI state: `ACTIVE`
+- Network calls: 0
+
+PASS — Free AI confirmation gate smoke test
+- Matching LONG setup accepted.
+- Gate remains bounded and cannot bypass other NOVA risk guards.
+
+PASS — OpenAI quota fallback state
+- `openai_ai_suspended=True` + `NO_CREDITS` surfaces fallback mode.
+- V7.2.3 worker stops repeating OpenAI calls after a recognized 429 quota/credit error for the running process.
+
+PASS — Version
+- `APP_VERSION = 7.2.3`
+
+Notes:
+- Local Quant AI is deterministic logic, not a generative model.
+- No claim of profitability is implied by these software tests.
+- Keep PAPER/SHADOW mode for evaluation.
