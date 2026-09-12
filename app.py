@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.1.2"
+APP_VERSION = "7.1.3"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -44,6 +44,9 @@ MEME_ASSETS = {"DOGE","SHIB","PEPE","BONK","WIF","FLOKI","BOME","BRETT","MOG","T
 # This is an overlay on top of the profitable V7 flow/momentum engine; it does not replace
 # PumpPortal realtime logic or the existing liquidity/security/risk gates.
 CANDLE_ENGINE_ENABLED = os.getenv("NOVA_CANDLE_ENGINE_ENABLED", "true").lower() in ("1","true","yes","on")
+# V7.1.3 Profit Core Restore: candles are observability only and can never alter V7.0 scores/gates.
+CANDLE_DECISION_IMPACT = False
+PROFIT_CORE_VERSION = "7.0.0"
 CANDLE_REFRESH_SEC = max(30, min(300, int(float(os.getenv("NOVA_CANDLE_REFRESH_SEC", "60")))))
 CANDLE_SCAN_CAP = max(3, min(24, int(float(os.getenv("NOVA_CANDLE_SCAN_CAP", "10")))))
 CANDLE_KLINE_LIMIT = max(210, min(500, int(float(os.getenv("NOVA_CANDLE_KLINE_LIMIT", "240")))))
@@ -51,7 +54,8 @@ CANDLE_CONCURRENCY = max(2, min(10, int(float(os.getenv("NOVA_CANDLE_CONCURRENCY
 CANDLE_TIMEFRAMES = tuple(x.strip() for x in os.getenv("NOVA_CANDLE_TIMEFRAMES", "5m,15m,1h,4h").split(",") if x.strip())
 CANDLE_OVERLAY_WEIGHT = max(0.10, min(0.45, float(os.getenv("NOVA_CANDLE_OVERLAY_WEIGHT", "0.28"))))
 CANDLE_SPOT_OVERLAY_WEIGHT = max(0.08, min(0.35, float(os.getenv("NOVA_CANDLE_SPOT_OVERLAY_WEIGHT", "0.22"))))
-CANDLE_HARD_GATE = os.getenv("NOVA_CANDLE_HARD_GATE", "true").lower() in ("1","true","yes","on")
+CANDLE_HARD_GATE_REQUESTED = os.getenv("NOVA_CANDLE_HARD_GATE", "false").lower() in ("1","true","yes","on")
+CANDLE_HARD_GATE = False
 CANDLE_GATE_MIN_CONFIDENCE = max(50.0, min(90.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_CONFIDENCE", "65"))))
 CANDLE_GATE_OPPOSITE_SCORE = max(65.0, min(95.0, float(os.getenv("NOVA_CANDLE_GATE_OPPOSITE_SCORE", "80"))))
 CANDLE_GATE_MIN_EDGE = max(10.0, min(35.0, float(os.getenv("NOVA_CANDLE_GATE_MIN_EDGE", "20"))))
@@ -67,16 +71,16 @@ CANDLE_EFFECTIVE_CONCURRENCY = min(CANDLE_CONCURRENCY, 4 if FREE_LITE else CANDL
 GLOBAL_LOSS_GUARD_ENABLED = os.getenv("NOVA_GLOBAL_LOSS_GUARD_ENABLED", "true").lower() in ("1","true","yes","on")
 GLOBAL_LOSS_LOOKBACK = max(4, min(30, int(float(os.getenv("NOVA_GLOBAL_LOSS_LOOKBACK", "12")))))
 GLOBAL_LOSS_CAUTION_RISK = max(0.10, min(0.80, float(os.getenv("NOVA_GLOBAL_LOSS_CAUTION_RISK", "0.50"))))
-GLOBAL_LOSS_CAUTION_THRESHOLD_ADD = max(0.0, min(10.0, float(os.getenv("NOVA_GLOBAL_LOSS_CAUTION_THRESHOLD_ADD", "3"))))
+GLOBAL_LOSS_CAUTION_THRESHOLD_ADD = 0.0  # V7.1.3: V7.0 signal thresholds are locked
 GLOBAL_LOSS_COOLDOWN_COUNT = max(2, min(4, int(float(os.getenv("NOVA_GLOBAL_LOSS_COOLDOWN_COUNT", "2")))))
 GLOBAL_LOSS_COOLDOWN_MIN = max(5, min(180, int(float(os.getenv("NOVA_GLOBAL_LOSS_COOLDOWN_MIN", "30")))))
 GLOBAL_LOSS_SAFE_COUNT = max(GLOBAL_LOSS_COOLDOWN_COUNT + 1, min(6, int(float(os.getenv("NOVA_GLOBAL_LOSS_SAFE_COUNT", "3")))))
 GLOBAL_LOSS_SAFE_COOLDOWN_MIN = max(GLOBAL_LOSS_COOLDOWN_MIN, min(360, int(float(os.getenv("NOVA_GLOBAL_LOSS_SAFE_COOLDOWN_MIN", "90")))))
 GLOBAL_LOSS_PROBE_RISK = max(0.10, min(0.50, float(os.getenv("NOVA_GLOBAL_LOSS_PROBE_RISK", "0.25"))))
-GLOBAL_LOSS_PROBE_THRESHOLD_ADD = max(GLOBAL_LOSS_CAUTION_THRESHOLD_ADD, min(12.0, float(os.getenv("NOVA_GLOBAL_LOSS_PROBE_THRESHOLD_ADD", "5"))))
+GLOBAL_LOSS_PROBE_THRESHOLD_ADD = 0.0  # risk/cooldown only
 GLOBAL_LOSS_RECOVERY_RISK = max(GLOBAL_LOSS_PROBE_RISK, min(0.90, float(os.getenv("NOVA_GLOBAL_LOSS_RECOVERY_RISK", "0.65"))))
-GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD = max(0.0, min(GLOBAL_LOSS_PROBE_THRESHOLD_ADD, float(os.getenv("NOVA_GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD", "2"))))
-GLOBAL_LOSS_LAUNCH_SCORE_ADD = max(0.0, min(12.0, float(os.getenv("NOVA_GLOBAL_LOSS_LAUNCH_SCORE_ADD", "2"))))
+GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD = 0.0  # risk/cooldown only
+GLOBAL_LOSS_LAUNCH_SCORE_ADD = 0.0  # V7.0 Launch score floor locked
 GLOBAL_LOSS_STATUS_CACHE = {"ts":0.0,"value":None}
 
 PUMPPORTAL_API_KEY_RAW = os.getenv("PUMPPORTAL_API_KEY","")
@@ -1716,37 +1720,20 @@ async def refresh_candle_intelligence(client,pairs,force=False):
             runtime["candle_refresh_duration_ms"]=round((time.monotonic()-started)*1000,1)
 
 def apply_candle_overlay(pairs):
+    """Attach Candle Brain telemetry without changing any V7.0 trading score or direction."""
     if not CANDLE_ENGINE_ENABLED:return pairs
     cache=runtime.get("candle_intelligence") or {}
     for c in pairs or []:
         intel=cache.get(c.get("mint"))
         if not intel:continue
-        c["candle_intelligence"]=intel;c["candle_long_score"]=intel.get("long_score");c["candle_short_score"]=intel.get("short_score")
-        if c.get("perp_eligible"):
-            w=CANDLE_OVERLAY_WEIGHT
-            c["long_score"]=round((1-w)*nz(c.get("long_score"))+w*nz(intel.get("long_score")),1)
-            c["short_score"]=round((1-w)*nz(c.get("short_score"))+w*nz(intel.get("short_score")),1)
-            edge=abs(c["long_score"]-c["short_score"]);c["direction_edge"]=round(edge,1)
-            c["direction"]="WAIT" if edge<4 else ("LONG" if c["long_score"]>c["short_score"] else "SHORT")
-        elif str(c.get("data_source"))=="BINANCE_SPOT":
-            w=CANDLE_SPOT_OVERLAY_WEIGHT;cl=nz(intel.get("long_score"))
-            c["pump_score"]=round((1-w)*nz(c.get("pump_score"))+w*cl,1)
-            c["scalp_score"]=round((1-w)*nz(c.get("scalp_score"))+w*cl,1)
-            c["long_score"]=max(nz(c.get("long_score")),round((c["pump_score"]+c["scalp_score"])/2,1))
-            if intel.get("bias")=="BEARISH" and nz(intel.get("confidence"))>=75 and nz(intel.get("short_score"))-cl>=20:
-                c["direction"]="WAIT"
+        c["candle_intelligence"]=intel
+        c["candle_long_score"]=intel.get("long_score")
+        c["candle_short_score"]=intel.get("short_score")
     return pairs
 
 def candle_confirmation_gate(c,strategy):
-    if not (CANDLE_ENGINE_ENABLED and CANDLE_HARD_GATE):return True,"ok"
-    intel=c.get("candle_intelligence") or (runtime.get("candle_intelligence") or {}).get(c.get("mint"))
-    if not intel or nz(intel.get("confidence"))<CANDLE_GATE_MIN_CONFIDENCE:return True,"ok"
-    side=strategy_side(strategy)
-    own=nz(intel.get("long_score")) if side=="LONG" else nz(intel.get("short_score"))
-    opp=nz(intel.get("short_score")) if side=="LONG" else nz(intel.get("long_score"))
-    if opp>=CANDLE_GATE_OPPOSITE_SCORE and opp-own>=CANDLE_GATE_MIN_EDGE:
-        return False,"candle structure strongly contradicts entry"
-    return True,"ok"
+    # V7.1.3: monitoring only. Candle analysis is never an entry/exit gate.
+    return True,"monitor_only"
 
 def candle_intelligence_status():
     cache=list((runtime.get("candle_intelligence") or {}).values())
@@ -1759,7 +1746,7 @@ def candle_intelligence_status():
                 "bias":x.get("bias"),"long_score":x.get("long_score"),"short_score":x.get("short_score"),"confidence":x.get("confidence"),
                 "agreement":x.get("agreement"),"structure":x.get("structure"),"rsi14":x.get("rsi14"),"atr_pct":x.get("atr_pct"),
                 "m15_rsi":t15.get("rsi14"),"h1_structure":t1.get("structure"),"h1_pattern":t1.get("pattern")}
-    return {"enabled":CANDLE_ENGINE_ENABLED,"hard_gate":CANDLE_HARD_GATE,"tracked":len(cache),"majors":majors,
+    return {"enabled":CANDLE_ENGINE_ENABLED,"mode":"MONITOR_ONLY","decision_impact":False,"hard_gate":False,"requested_hard_gate":CANDLE_HARD_GATE_REQUESTED,"tracked":len(cache),"majors":majors,
             "bullish":bullish,"bearish":bearish,"neutral":neutral,"timeframes":list(CANDLE_TIMEFRAMES),
             "last_refresh":runtime.get("candle_last_refresh"),"refresh_count":runtime.get("candle_refresh_count",0),
             "errors":len(runtime.get("candle_errors") or {}),"worker_alive":bool(runtime.get("candle_worker_alive")),
@@ -3021,14 +3008,11 @@ def optimizer_report(strategy):
 
 def effective_threshold(strategy,c=None):
     base=base_threshold(strategy)
-    th=base
-    if b("adaptive_enabled"):
-        rep=optimizer_report(strategy)
-        th=rep.get("effective_threshold",base)
+    if not b("adaptive_enabled"):return base
+    rep=optimizer_report(strategy)
+    th=rep.get("effective_threshold",base)
     # Regime-aware tightening. Never loosen because of volatility.
     if c and c.get("volatility_regime")=="HIGH":th+=2
-    # V7.1.2: cross-strategy loss state tightens the next entry after even one loss.
-    th+=global_loss_threshold_add()
     return min(95,th)
 
 def strategy_health(strategy):
@@ -3125,13 +3109,13 @@ def global_loss_guard_status(force=False):
         if len(rows)>=2 and nz(rows[0].pnl)>0 and nz(rows[1].pnl)<0:
             base.update({"state":"RECOVERING","risk_multiplier":GLOBAL_LOSS_RECOVERY_RISK,
                          "threshold_add":GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD,
-                         "message":"win after loss; staged recovery"})
+                         "message":"win after loss; staged risk recovery • V7.0 signals unchanged"})
         return finish(base)
 
     if streak==1:
         base.update({"state":"CAUTION","risk_multiplier":GLOBAL_LOSS_CAUTION_RISK,
                      "threshold_add":GLOBAL_LOSS_CAUTION_THRESHOLD_ADD,
-                     "message":"first loss; de-risk and tighten next entry"})
+                     "message":"first loss; risk reduced • V7.0 signals unchanged"})
         return finish(base)
 
     safe=streak>=GLOBAL_LOSS_SAFE_COUNT
@@ -3147,7 +3131,7 @@ def global_loss_guard_status(force=False):
     # Once the cooldown expires, allow exactly one reduced-size recovery probe at a time.
     base.update({"state":"RECOVERY_PROBE","risk_multiplier":GLOBAL_LOSS_PROBE_RISK,
                  "threshold_add":GLOBAL_LOSS_PROBE_THRESHOLD_ADD,"probe":True,
-                 "message":"cooldown complete; one reduced-size probe allowed"})
+                 "message":"cooldown complete; one reduced-size probe allowed • V7.0 signals unchanged"})
     return finish(base)
 
 def global_loss_guard_gate():
@@ -3165,8 +3149,8 @@ def global_loss_risk_multiplier():
     return max(0.0,min(1.0,nz(global_loss_guard_status().get("risk_multiplier"),1.0)))
 
 def global_loss_threshold_add():
-    if not GLOBAL_LOSS_GUARD_ENABLED:return 0.0
-    return max(0.0,nz(global_loss_guard_status().get("threshold_add"),0.0))
+    # V7.1.3: Global Loss Guard may reduce risk/block entries, never change the V7.0 signal threshold.
+    return 0.0
 
 def strategy_recent_trade_stats(strategy,limit=None):
     limit=limit or i("governor_recent_trades")
@@ -3339,11 +3323,6 @@ def gate(c,strategy=None):
 
     if strategy and strategy_side(strategy)=="SHORT" and not c.get("perp_eligible"):
         return False,"short unavailable for spot-only token"
-
-    if strategy:
-        cok,creason=candle_confirmation_gate(c,strategy)
-        if not cok:
-            return False,creason
 
     with SessionLocal() as s:
         if s.scalar(select(Position).where(Position.mint==c["mint"])):
@@ -4207,10 +4186,7 @@ def launch_gate(m):
     if nz(m.get("buy_sol_2s"))<(min(f("launch_min_buy_sol_2s"),PROFIT_LAUNCH_MIN_BUY_SOL) if profit_cycle_active() else f("launch_min_buy_sol_2s")):return False,"launch low buy flow"
     if nz(m.get("top_buyer_share_pct"),100)>f("launch_max_top_buyer_share_pct"):
         return False,"launch buyer concentration"
-    launch_score_floor=(min(f("launch_min_score"),PROFIT_LAUNCH_MIN_SCORE) if profit_cycle_active() else f("launch_min_score"))
-    launch_score_floor=min(95.0,launch_score_floor+global_loss_threshold_add()+
-                           (GLOBAL_LOSS_LAUNCH_SCORE_ADD if global_loss_guard_status().get("state") in ("CAUTION","RECOVERY_PROBE","RECOVERING") else 0.0))
-    if nz(m.get("score"))<launch_score_floor:return False,"launch low score"
+    if nz(m.get("score"))<(min(f("launch_min_score"),PROFIT_LAUNCH_MIN_SCORE) if profit_cycle_active() else f("launch_min_score")):return False,"launch low score"
     if not nz(m.get("current_mcap")) or not m.get("mcap_kind"):
         return False,"launch no price reference"
 
@@ -4293,8 +4269,8 @@ def launch_position_size(m):
     eq=max(0,nz(metrics().get("equity")))
     if profit_cycle_active():
         cap=eq*1.00/100
-        # V7.1.2: respect probation and global-loss de-risking; do not force a 0.50 floor.
-        gov=max(governor_risk_multiplier("LAUNCH_SNIPER"),0.25)
+        # V7.1.3 Profit Core Restore: preserve V7.0 launch sizing behavior.
+        gov=max(governor_risk_multiplier("LAUNCH_SNIPER"),0.50)
     else:
         cap=eq*f("launch_max_position_pct")/100
         gov=governor_risk_multiplier("LAUNCH_SNIPER")
@@ -5786,7 +5762,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.3"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5864,8 +5840,8 @@ async def candle_intelligence_loop():
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA V7.1.1 universal + candle-intelligence engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.1"}) as client:
+    record_event("INFO","ENGINE_START","NOVA V7.1.3 universal engine • V7.0 profit core locked • candle monitor-only",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.3"}) as client:
         addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
@@ -6192,6 +6168,9 @@ def health():
     return {
         "ok":True,
         "version":APP_VERSION,
+        "profit_core_version":PROFIT_CORE_VERSION,
+        "profit_core_locked":True,
+        "candle_decision_impact":False,
         "free_lite":FREE_LITE,
         "process":"UP",
         "loop_alive":bool(runtime.get("loop_alive")),
@@ -6247,6 +6226,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
     return {
         "version":APP_VERSION,
+        "profit_core":{"version":PROFIT_CORE_VERSION,"locked":True,"candle_decision_impact":False,"global_loss_scope":"risk_cooldown_only"},
         "free_lite":{
             "enabled":FREE_LITE,
             "pulse_subscriptions":len(runtime.get("pulse_subscribed",set())),
