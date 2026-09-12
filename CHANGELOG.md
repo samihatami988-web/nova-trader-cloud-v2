@@ -1,11 +1,8 @@
-# Changelog
+# NOVA Trader V7.2.2
 
-## 7.2.1 — OpenAI AI Brain
-- Added real OpenAI Responses API integration for major perpetual markets.
-- Added strict structured JSON assessment: LONG/SHORT/WAIT, confidence, regime, risk, bounded score adjustments, reasons.
-- Added asynchronous AI worker and cache so LLM latency never blocks the trading loop.
-- Meme/launch hot path remains LLM-free and event-driven.
-- Added high-confidence contradiction veto for major perps only.
-- Added `/api/ai-analysis` and dashboard OpenAI AI Brain telemetry.
-- API key remains server-side only.
-- Risk guards and LIVE execution hard-lock remain authoritative.
+- Added visible OpenAI HTTP status, latency, error type/message, attempts, successes and detailed error counters.
+- Added Northflank-safe `[NOVA][OpenAI]` diagnostic log lines.
+- Fixed AI success accounting: attempts and successful analyses are now counted separately.
+- Fixed major-perp AI cache key fallback when a CEX/perp candidate has no mint.
+- Raised default OpenAI timeout to 20s while keeping calls off the meme/launch hot path.
+- Trading/risk thresholds remain unchanged from V7.2.1.

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.2.1"
+APP_VERSION = "7.2.2"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -86,7 +86,7 @@ MAJOR_TRADER_CANDLE_WEIGHT = max(0.20, min(0.60, float(os.getenv("NOVA_MAJOR_TRA
 MAJOR_TRADER_FLOW_WEIGHT = 1.0 - MAJOR_TRADER_CANDLE_WEIGHT
 MAJOR_TRADER_MAX_ATR_PCT = max(2.0, min(15.0, float(os.getenv("NOVA_MAJOR_TRADER_MAX_ATR_PCT", "8"))))
 
-# V7.2.1 OpenAI AI Brain. Runs asynchronously on major perpetuals only so it never
+# V7.2.2 OpenAI AI Brain diagnostics + recovery. Runs asynchronously on major perpetuals only so it never
 # adds LLM latency to the meme/launch hot path. Deterministic risk guards remain final.
 OPENAI_AI_ENABLED = os.getenv("NOVA_OPENAI_AI_ENABLED", "true").lower() in ("1","true","yes","on")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -95,7 +95,7 @@ OPENAI_BASE_URL = os.getenv("NOVA_OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_AI_REFRESH_SEC = max(30, min(300, int(float(os.getenv("NOVA_OPENAI_AI_REFRESH_SEC", "75")))))
 OPENAI_AI_CACHE_SEC = max(45, min(600, int(float(os.getenv("NOVA_OPENAI_AI_CACHE_SEC", "180")))))
 OPENAI_AI_TOP_N = max(1, min(8, int(float(os.getenv("NOVA_OPENAI_AI_TOP_N", "4")))))
-OPENAI_AI_TIMEOUT_SEC = max(5.0, min(25.0, float(os.getenv("NOVA_OPENAI_AI_TIMEOUT_SEC", "12"))))
+OPENAI_AI_TIMEOUT_SEC = max(5.0, min(30.0, float(os.getenv("NOVA_OPENAI_AI_TIMEOUT_SEC", "20"))))
 OPENAI_AI_MAX_ADJUST = max(1.0, min(10.0, float(os.getenv("NOVA_OPENAI_AI_MAX_ADJUST", "5"))))
 OPENAI_AI_MIN_CONF = max(55.0, min(90.0, float(os.getenv("NOVA_OPENAI_AI_MIN_CONF", "68"))))
 OPENAI_AI_BLOCK_CONF = max(70.0, min(98.0, float(os.getenv("NOVA_OPENAI_AI_BLOCK_CONF", "88"))))
@@ -640,8 +640,19 @@ runtime = {
     "openai_ai_inflight": False,
     "openai_ai_last_refresh": None,
     "openai_ai_last_error": None,
+    "openai_ai_last_error_type": None,
+    "openai_ai_last_http_status": None,
+    "openai_ai_last_latency_ms": None,
+    "openai_ai_last_response_id": None,
+    "openai_ai_last_attempt": None,
+    "openai_ai_last_success": None,
+    "openai_ai_attempts": 0,
     "openai_ai_calls": 0,
     "openai_ai_errors": 0,
+    "openai_ai_http_errors": 0,
+    "openai_ai_timeout_errors": 0,
+    "openai_ai_parse_errors": 0,
+    "openai_ai_empty_output_errors": 0,
     "last_refresh": None,
     "last_error": None,
     "prev_liq": {},
@@ -1956,15 +1967,82 @@ async def _openai_analyze_major(client,c):
         "reasoning":{"effort":"low"},
         "text":{"format":{"type":"json_schema","name":"nova_market_assessment","schema":schema,"strict":True}}
     }
-    r=await client.post(OPENAI_BASE_URL+"/responses",headers={"Authorization":"Bearer "+OPENAI_API_KEY,"Content-Type":"application/json"},json=body,timeout=OPENAI_AI_TIMEOUT_SEC)
-    r.raise_for_status()
-    payload=r.json(); txt=_openai_output_text(payload)
-    data=json.loads(txt)
-    data["model"]=OPENAI_MODEL; data["response_id"]=payload.get("id"); data["updated_at"]=datetime.now(timezone.utc).isoformat()
+    started=time.perf_counter()
+    runtime["openai_ai_attempts"]=int(runtime.get("openai_ai_attempts",0))+1
+    runtime["openai_ai_last_attempt"]=datetime.now(timezone.utc).isoformat()
+    try:
+        r=await client.post(
+            OPENAI_BASE_URL+"/responses",
+            headers={"Authorization":"Bearer "+OPENAI_API_KEY,"Content-Type":"application/json"},
+            json=body,
+            timeout=OPENAI_AI_TIMEOUT_SEC
+        )
+    except httpx.TimeoutException as e:
+        latency=round((time.perf_counter()-started)*1000,1)
+        runtime["openai_ai_last_latency_ms"]=latency
+        runtime["openai_ai_last_error_type"]="TIMEOUT"
+        runtime["openai_ai_timeout_errors"]=int(runtime.get("openai_ai_timeout_errors",0))+1
+        raise RuntimeError(f"OpenAI timeout after {latency:.0f}ms") from e
+    except httpx.RequestError as e:
+        latency=round((time.perf_counter()-started)*1000,1)
+        runtime["openai_ai_last_latency_ms"]=latency
+        runtime["openai_ai_last_error_type"]="NETWORK"
+        raise RuntimeError(f"OpenAI network error: {type(e).__name__}: {str(e)[:180]}") from e
+
+    latency=round((time.perf_counter()-started)*1000,1)
+    runtime["openai_ai_last_latency_ms"]=latency
+    runtime["openai_ai_last_http_status"]=int(r.status_code)
+    req_id=r.headers.get("x-request-id") or r.headers.get("request-id")
+    if req_id:
+        runtime["openai_ai_last_response_id"]=req_id
+
+    if r.status_code < 200 or r.status_code >= 300:
+        runtime["openai_ai_last_error_type"]="HTTP"
+        runtime["openai_ai_http_errors"]=int(runtime.get("openai_ai_http_errors",0))+1
+        try:
+            err_payload=r.json()
+            err=(err_payload.get("error") or {}) if isinstance(err_payload,dict) else {}
+            msg=str(err.get("message") or err_payload)[:500]
+            code=str(err.get("code") or "")[:100]
+            typ=str(err.get("type") or "")[:100]
+            detail=f"status={r.status_code} type={typ or '-'} code={code or '-'} message={msg}"
+        except Exception:
+            detail=f"status={r.status_code} body={r.text[:500]}"
+        raise RuntimeError("OpenAI HTTP error: "+detail)
+
+    try:
+        payload=r.json()
+    except Exception as e:
+        runtime["openai_ai_last_error_type"]="RESPONSE_JSON"
+        runtime["openai_ai_parse_errors"]=int(runtime.get("openai_ai_parse_errors",0))+1
+        raise RuntimeError(f"OpenAI returned non-JSON response: {r.text[:300]}") from e
+
+    response_id=payload.get("id") if isinstance(payload,dict) else None
+    if response_id:
+        runtime["openai_ai_last_response_id"]=response_id
+    txt=_openai_output_text(payload if isinstance(payload,dict) else {})
+    if not txt.strip():
+        runtime["openai_ai_last_error_type"]="EMPTY_OUTPUT"
+        runtime["openai_ai_empty_output_errors"]=int(runtime.get("openai_ai_empty_output_errors",0))+1
+        status=(payload.get("status") if isinstance(payload,dict) else None)
+        incomplete=(payload.get("incomplete_details") if isinstance(payload,dict) else None)
+        raise RuntimeError(f"OpenAI response had no output_text; response_status={status} incomplete={str(incomplete)[:180]}")
+    try:
+        data=json.loads(txt)
+    except Exception as e:
+        runtime["openai_ai_last_error_type"]="STRUCTURED_PARSE"
+        runtime["openai_ai_parse_errors"]=int(runtime.get("openai_ai_parse_errors",0))+1
+        raise RuntimeError(f"OpenAI structured-output parse failed: {str(e)[:180]}; output={txt[:260]}") from e
+
+    data["model"]=OPENAI_MODEL; data["response_id"]=response_id; data["updated_at"]=datetime.now(timezone.utc).isoformat()
     data["symbol"]=snap["symbol"]; data["mint"]=c.get("mint")
     data["confidence"]=round(clamp(nz(data.get("confidence")),0,100),1)
     data["long_adjustment"]=round(clamp(nz(data.get("long_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST),2)
     data["short_adjustment"]=round(clamp(nz(data.get("short_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST),2)
+    runtime["openai_ai_last_error"]=None
+    runtime["openai_ai_last_error_type"]=None
+    runtime["openai_ai_last_success"]=datetime.now(timezone.utc).isoformat()
+    runtime["openai_ai_calls"]=int(runtime.get("openai_ai_calls",0))+1
     return data
 
 
@@ -1985,14 +2063,22 @@ async def openai_ai_brain_loop():
                 runtime["openai_ai_inflight"]=True; runtime["openai_ai_state"]="ANALYZING"
                 cache=dict(runtime.get("openai_ai_cache") or {})
                 ok=0
+                cycle_errors=0
                 for c in rows:
                     try:
                         out=await _openai_analyze_major(client,c)
                         if out:
-                            cache[c.get("mint")]=out;ok+=1
+                            # Some CEX/perp candidates do not expose a mint. Use a stable market key instead.
+                            key=c.get("mint") or f"{str(c.get('data_source') or 'PERP')}:{str(c.get('symbol') or '').upper()}:{str(c.get('perp_market') or '')}"
+                            cache[key]=out;ok+=1
                     except Exception as e:
-                        runtime["openai_ai_last_error"]=str(e)[:300]
+                        cycle_errors+=1
+                        msg=str(e)[:500]
+                        runtime["openai_ai_last_error"]=msg
                         runtime["openai_ai_errors"]=int(runtime.get("openai_ai_errors",0))+1
+                        if not runtime.get("openai_ai_last_error_type"):
+                            runtime["openai_ai_last_error_type"]=type(e).__name__
+                        print(f"[NOVA][OpenAI][{runtime.get('openai_ai_last_error_type')}] {msg}", flush=True)
                 # prune stale analyses
                 cutoff=datetime.now(timezone.utc)-timedelta(seconds=OPENAI_AI_CACHE_SEC*2)
                 for k,v in list(cache.items()):
@@ -2003,12 +2089,20 @@ async def openai_ai_brain_loop():
                     except Exception: cache.pop(k,None)
                 runtime["openai_ai_cache"]=cache
                 runtime["openai_ai_last_refresh"]=datetime.now(timezone.utc).isoformat()
-                runtime["openai_ai_calls"]=int(runtime.get("openai_ai_calls",0))+ok
-                runtime["openai_ai_state"]="ACTIVE" if ok else "DEGRADED"
+                if ok:
+                    runtime["openai_ai_state"]="ACTIVE"
+                elif cycle_errors:
+                    runtime["openai_ai_state"]="DEGRADED"
+                else:
+                    runtime["openai_ai_state"]="WAITING_FOR_OUTPUT"
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                runtime["openai_ai_last_error"]=str(e)[:300];runtime["openai_ai_state"]="ERROR"
+                msg=str(e)[:500]
+                runtime["openai_ai_last_error"]=msg;runtime["openai_ai_state"]="ERROR"
+                runtime["openai_ai_errors"]=int(runtime.get("openai_ai_errors",0))+1
+                runtime["openai_ai_last_error_type"]=type(e).__name__
+                print(f"[NOVA][OpenAI][LOOP] {msg}", flush=True)
             finally:
                 runtime["openai_ai_inflight"]=False
             await asyncio.sleep(OPENAI_AI_REFRESH_SEC)
@@ -2056,13 +2150,22 @@ def openai_ai_confirmation_gate(c,strategy):
 def openai_ai_brain_status():
     cache=list((runtime.get("openai_ai_cache") or {}).values())
     cache.sort(key=lambda x:nz(x.get("confidence")),reverse=True)
+    attempts=int(runtime.get("openai_ai_attempts",0))
+    success=int(runtime.get("openai_ai_calls",0))
     return {
         "enabled":OPENAI_AI_ENABLED,"configured":bool(OPENAI_API_KEY),"model":OPENAI_MODEL,
         "state":runtime.get("openai_ai_state","STARTING"),"worker_alive":bool(runtime.get("openai_ai_worker_alive")),
         "inflight":bool(runtime.get("openai_ai_inflight")),"last_refresh":runtime.get("openai_ai_last_refresh"),
-        "calls":runtime.get("openai_ai_calls",0),"errors":runtime.get("openai_ai_errors",0),
-        "last_error":runtime.get("openai_ai_last_error"),"tracked":len(cache),
-        "decision_scope":"MAJOR_PERP_CONFIRMATION_ONLY","meme_hot_path":"NO_LLM_LATENCY",
+        "attempts":attempts,"calls":success,"errors":runtime.get("openai_ai_errors",0),
+        "success_rate_pct":round((success/attempts)*100,1) if attempts else None,
+        "last_error":runtime.get("openai_ai_last_error"),"last_error_type":runtime.get("openai_ai_last_error_type"),
+        "last_http_status":runtime.get("openai_ai_last_http_status"),"last_latency_ms":runtime.get("openai_ai_last_latency_ms"),
+        "last_response_id":runtime.get("openai_ai_last_response_id"),"last_attempt":runtime.get("openai_ai_last_attempt"),
+        "last_success":runtime.get("openai_ai_last_success"),
+        "http_errors":runtime.get("openai_ai_http_errors",0),"timeout_errors":runtime.get("openai_ai_timeout_errors",0),
+        "parse_errors":runtime.get("openai_ai_parse_errors",0),"empty_output_errors":runtime.get("openai_ai_empty_output_errors",0),
+        "tracked":len(cache),"decision_scope":"MAJOR_PERP_CONFIRMATION_ONLY","meme_hot_path":"NO_LLM_LATENCY",
+        "diagnostic_mode":"V7.2.2_VISIBLE_HTTP_PARSE_TIMEOUT_DIAGNOSTICS",
         "top":[{"symbol":x.get("symbol"),"decision":x.get("decision"),"confidence":x.get("confidence"),"regime":x.get("regime"),"risk":x.get("risk"),"reasons":x.get("reasons"),"updated_at":x.get("updated_at")} for x in cache[:8]]
     }
 
@@ -6531,6 +6634,12 @@ def health():
         "profit_core_version":PROFIT_CORE_VERSION,"hybrid_brain_enabled":HYBRID_BRAIN_ENABLED,
         "openai_ai_enabled":OPENAI_AI_ENABLED,"openai_ai_configured":bool(OPENAI_API_KEY),"openai_ai_model":OPENAI_MODEL,
         "openai_ai_state":runtime.get("openai_ai_state"),
+        "openai_ai_last_http_status":runtime.get("openai_ai_last_http_status"),
+        "openai_ai_last_error_type":runtime.get("openai_ai_last_error_type"),
+        "openai_ai_last_error":runtime.get("openai_ai_last_error"),
+        "openai_ai_last_latency_ms":runtime.get("openai_ai_last_latency_ms"),
+        "openai_ai_attempts":runtime.get("openai_ai_attempts",0),
+        "openai_ai_successes":runtime.get("openai_ai_calls",0),
         "profit_core_locked":True,
         "candle_decision_impact":CANDLE_DECISION_IMPACT,
         "free_lite":FREE_LITE,
