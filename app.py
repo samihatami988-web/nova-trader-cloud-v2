@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.1.4"
+APP_VERSION = "7.2.1"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -64,6 +64,41 @@ CANDLE_HTTP_TIMEOUT_SEC = max(3.0, min(12.0, float(os.getenv("NOVA_CANDLE_HTTP_T
 CANDLE_HTTP_RETRIES = max(0, min(2, int(float(os.getenv("NOVA_CANDLE_HTTP_RETRIES", "1")))))
 CANDLE_WORKER_TICK_SEC = max(3.0, min(15.0, float(os.getenv("NOVA_CANDLE_WORKER_TICK_SEC", "8"))))
 CANDLE_EFFECTIVE_CONCURRENCY = min(CANDLE_CONCURRENCY, 4 if FREE_LITE else CANDLE_CONCURRENCY)
+
+
+# V7.2 Hybrid Intelligence: fast meme/token micro-profit + analytical major/perp trader.
+HYBRID_BRAIN_ENABLED = os.getenv("NOVA_HYBRID_BRAIN_ENABLED", "true").lower() in ("1","true","yes","on")
+MEME_FAST_ENGINE_ENABLED = os.getenv("NOVA_MEME_FAST_ENGINE_ENABLED", "true").lower() in ("1","true","yes","on")
+MEME_FAST_SCALP_FLOOR = max(58.0, min(72.0, float(os.getenv("NOVA_MEME_FAST_SCALP_FLOOR", "64"))))
+MEME_FAST_PUMP_FLOOR = max(58.0, min(72.0, float(os.getenv("NOVA_MEME_FAST_PUMP_FLOOR", "64"))))
+MEME_FAST_MIN_QUALITY = max(50.0, min(75.0, float(os.getenv("NOVA_MEME_FAST_MIN_QUALITY", "57"))))
+MEME_FAST_MIN_LIQ = max(10000.0, float(os.getenv("NOVA_MEME_FAST_MIN_LIQ", "22000")))
+MEME_FAST_MIN_BUY_PRESSURE = max(52.0, min(75.0, float(os.getenv("NOVA_MEME_FAST_MIN_BUY_PRESSURE", "56"))))
+MEME_FAST_MAX_M5 = max(3.0, min(30.0, float(os.getenv("NOVA_MEME_FAST_MAX_M5_PCT", "12"))))
+MEME_FAST_BASE_RISK = max(0.15, min(0.60, float(os.getenv("NOVA_MEME_FAST_BASE_RISK", "0.30"))))
+MEME_FAST_MAX_RISK = max(MEME_FAST_BASE_RISK, min(0.80, float(os.getenv("NOVA_MEME_FAST_MAX_RISK", "0.55"))))
+
+MAJOR_TRADER_ENABLED = os.getenv("NOVA_MAJOR_TRADER_ENABLED", "true").lower() in ("1","true","yes","on")
+MAJOR_TRADER_MIN_CONF = max(50.0, min(90.0, float(os.getenv("NOVA_MAJOR_TRADER_MIN_CONF", "62"))))
+MAJOR_TRADER_MIN_SCORE = max(58.0, min(80.0, float(os.getenv("NOVA_MAJOR_TRADER_MIN_SCORE", "66"))))
+MAJOR_TRADER_MIN_EDGE = max(4.0, min(30.0, float(os.getenv("NOVA_MAJOR_TRADER_MIN_EDGE", "9"))))
+MAJOR_TRADER_CANDLE_WEIGHT = max(0.20, min(0.60, float(os.getenv("NOVA_MAJOR_TRADER_CANDLE_WEIGHT", "0.40"))))
+MAJOR_TRADER_FLOW_WEIGHT = 1.0 - MAJOR_TRADER_CANDLE_WEIGHT
+MAJOR_TRADER_MAX_ATR_PCT = max(2.0, min(15.0, float(os.getenv("NOVA_MAJOR_TRADER_MAX_ATR_PCT", "8"))))
+
+# V7.2.1 OpenAI AI Brain. Runs asynchronously on major perpetuals only so it never
+# adds LLM latency to the meme/launch hot path. Deterministic risk guards remain final.
+OPENAI_AI_ENABLED = os.getenv("NOVA_OPENAI_AI_ENABLED", "true").lower() in ("1","true","yes","on")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("NOVA_OPENAI_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
+OPENAI_BASE_URL = os.getenv("NOVA_OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+OPENAI_AI_REFRESH_SEC = max(30, min(300, int(float(os.getenv("NOVA_OPENAI_AI_REFRESH_SEC", "75")))))
+OPENAI_AI_CACHE_SEC = max(45, min(600, int(float(os.getenv("NOVA_OPENAI_AI_CACHE_SEC", "180")))))
+OPENAI_AI_TOP_N = max(1, min(8, int(float(os.getenv("NOVA_OPENAI_AI_TOP_N", "4")))))
+OPENAI_AI_TIMEOUT_SEC = max(5.0, min(25.0, float(os.getenv("NOVA_OPENAI_AI_TIMEOUT_SEC", "12"))))
+OPENAI_AI_MAX_ADJUST = max(1.0, min(10.0, float(os.getenv("NOVA_OPENAI_AI_MAX_ADJUST", "5"))))
+OPENAI_AI_MIN_CONF = max(55.0, min(90.0, float(os.getenv("NOVA_OPENAI_AI_MIN_CONF", "68"))))
+OPENAI_AI_BLOCK_CONF = max(70.0, min(98.0, float(os.getenv("NOVA_OPENAI_AI_BLOCK_CONF", "88"))))
 
 # V7.1.2 Global Loss Guard + Adaptive Recovery.
 # This sits above individual strategy governors: after the first global loss it de-risks and tightens entries;
@@ -599,6 +634,14 @@ app.add_middleware(
 
 runtime = {
     "candidates": [],
+    "openai_ai_cache": {},
+    "openai_ai_state": "STARTING",
+    "openai_ai_worker_alive": False,
+    "openai_ai_inflight": False,
+    "openai_ai_last_refresh": None,
+    "openai_ai_last_error": None,
+    "openai_ai_calls": 0,
+    "openai_ai_errors": 0,
     "last_refresh": None,
     "last_error": None,
     "prev_liq": {},
@@ -1783,6 +1826,257 @@ def candle_intelligence_status():
             "worker_error":runtime.get("candle_worker_error"),"worker_failures":runtime.get("candle_worker_failures",0),
             "top":[small(x) for x in top]}
 
+
+def _is_fast_token_candidate(c):
+    if c.get("perp_eligible"):
+        return False
+    cls=str(c.get("asset_class") or "").upper()
+    src=str(c.get("data_source") or "").upper()
+    age=nz(c.get("age_minutes"),999999)
+    return cls in ("MEME","ALT") or src.startswith("DEXSCREENER") or age <= 1440
+
+
+def major_trader_context(c):
+    """Structured local decision layer for major perpetuals. No external LLM latency.
+    Combines V7 flow/perp scores with MTF candle structure, funding/OI and volatility.
+    Risk guards still own the final decision.
+    """
+    symbol=str(c.get("symbol") or "").upper()
+    if not (HYBRID_BRAIN_ENABLED and MAJOR_TRADER_ENABLED and c.get("perp_eligible") and symbol in MAJOR_ASSETS):
+        return {"enabled":False,"bias":"WAIT","confidence":0,"long_score":nz(c.get("long_score")),"short_score":nz(c.get("short_score")),"reason":"not_major_perp"}
+    intel=c.get("candle_intelligence") or (runtime.get("candle_intelligence") or {}).get(c.get("mint")) or {}
+    raw_l=nz(c.get("long_score"),50); raw_s=nz(c.get("short_score"),50)
+    cl=nz(intel.get("long_score"),50); cs=nz(intel.get("short_score"),50); conf=nz(intel.get("confidence"),45)
+    # Candle contribution scales down when confidence is weak.
+    cw=MAJOR_TRADER_CANDLE_WEIGHT*clamp((conf-40)/45,0.20,1.0)
+    fw=1.0-cw
+    long_score=raw_l*fw+cl*cw
+    short_score=raw_s*fw+cs*cw
+    funding=nz(c.get("funding_rate")); oi_change=nz(c.get("oi_change_pct")); atr=nz(intel.get("atr_pct"),nz(c.get("volatility_pct")))
+    # Small, bounded context adjustments. They cannot override hard risk guards.
+    if funding > 0.0015: short_score += min(4.0,funding*10000*0.35)
+    elif funding < -0.0015: long_score += min(4.0,abs(funding)*10000*0.35)
+    if oi_change > 2:
+        if long_score>short_score: long_score += min(3.0,oi_change*0.25)
+        else: short_score += min(3.0,oi_change*0.25)
+    if atr > MAJOR_TRADER_MAX_ATR_PCT:
+        long_score -= 5; short_score -= 5
+    long_score=round(clamp(long_score,0,100),1); short_score=round(clamp(short_score,0,100),1)
+    edge=round(long_score-short_score,1)
+    best=max(long_score,short_score)
+    bias="LONG" if edge>=MAJOR_TRADER_MIN_EDGE and best>=MAJOR_TRADER_MIN_SCORE else "SHORT" if edge<=-MAJOR_TRADER_MIN_EDGE and best>=MAJOR_TRADER_MIN_SCORE else "WAIT"
+    confidence=round(clamp((abs(edge)*1.7 + conf*0.55 + best*0.25),0,100),1)
+    if confidence < MAJOR_TRADER_MIN_CONF: bias="WAIT"
+    regime=str(intel.get("bias") or c.get("volatility_regime") or "UNKNOWN")
+    reason=f"flow L{raw_l:.0f}/S{raw_s:.0f} + MTF L{cl:.0f}/S{cs:.0f} conf {conf:.0f}"
+    return {"enabled":True,"bias":bias,"confidence":confidence,"long_score":long_score,"short_score":short_score,"edge":edge,"regime":regime,"atr_pct":round(atr,2),"funding_rate":funding,"oi_change_pct":oi_change,"reason":reason}
+
+
+def apply_hybrid_intelligence(pairs):
+    if not HYBRID_BRAIN_ENABLED:return pairs
+    for c in pairs or []:
+        ctx=major_trader_context(c)
+        if ctx.get("enabled"):
+            c["hybrid_ai"]=ctx
+            c["long_score"]=ctx["long_score"]; c["short_score"]=ctx["short_score"]
+            if ctx["bias"] in ("LONG","SHORT"):
+                c["direction"]=ctx["bias"]
+                c["direction_edge"]=abs(ctx["edge"])
+    return pairs
+
+
+def _openai_output_text(payload):
+    # Responses API returns assistant text inside output[].content[].text.
+    for item in payload.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if part.get("type") in ("output_text","text") and part.get("text"):
+                return str(part.get("text"))
+    return str(payload.get("output_text") or "")
+
+
+def _major_ai_snapshot(c):
+    intel=c.get("candle_intelligence") or {}
+    tfs=intel.get("timeframes") or {}
+    return {
+        "symbol":str(c.get("symbol") or "").upper(),
+        "market":c.get("perp_market"),
+        "price":nz(c.get("price")),
+        "deterministic_long_score":nz(c.get("long_score")),
+        "deterministic_short_score":nz(c.get("short_score")),
+        "direction":c.get("direction"),
+        "funding_rate":nz(c.get("funding_rate")),
+        "open_interest_usd":nz(c.get("open_interest_usd")),
+        "oi_change_pct":nz(c.get("oi_change_pct")),
+        "momentum_pct":nz(c.get("momentum_pct")),
+        "volatility_pct":nz(c.get("volatility_pct")),
+        "quote_volume_24h":nz(c.get("quote_volume_24h")),
+        "candle":{
+            "bias":intel.get("bias"),"confidence":nz(intel.get("confidence")),
+            "long_score":nz(intel.get("long_score")),"short_score":nz(intel.get("short_score")),
+            "structure":intel.get("structure"),"rsi14":intel.get("rsi14"),"atr_pct":intel.get("atr_pct"),
+            "agreement":intel.get("agreement"),
+            "5m":tfs.get("5m"),"15m":tfs.get("15m"),"1h":tfs.get("1h"),"4h":tfs.get("4h")
+        }
+    }
+
+
+async def _openai_analyze_major(client,c):
+    if not (OPENAI_AI_ENABLED and OPENAI_API_KEY):
+        return None
+    snap=_major_ai_snapshot(c)
+    schema={
+        "type":"object",
+        "properties":{
+            "decision":{"type":"string","enum":["LONG","SHORT","WAIT"]},
+            "confidence":{"type":"number","minimum":0,"maximum":100},
+            "regime":{"type":"string","enum":["TREND_UP","TREND_DOWN","RANGE","BREAKOUT","REVERSAL","HIGH_VOLATILITY","UNCLEAR"]},
+            "risk":{"type":"string","enum":["LOW","MEDIUM","HIGH"]},
+            "long_adjustment":{"type":"number","minimum":-10,"maximum":10},
+            "short_adjustment":{"type":"number","minimum":-10,"maximum":10},
+            "reasons":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4}
+        },
+        "required":["decision","confidence","regime","risk","long_adjustment","short_adjustment","reasons"],
+        "additionalProperties":False
+    }
+    prompt=(
+        "You are NOVA's market-regime classifier for PAPER/SHADOW trading. "
+        "Use only the supplied numerical market data. Do not invent news or prices. "
+        "Assess directional quality, not guaranteed profitability. Prefer WAIT when evidence conflicts. "
+        "Adjustments are small confirmation deltas, never position-size instructions. Market snapshot:\n"
+        + json.dumps(snap,separators=(",",":"),default=str)
+    )
+    body={
+        "model":OPENAI_MODEL,
+        "input":[
+            {"role":"developer","content":"Return only the requested structured market assessment. Risk controls and execution are handled by NOVA, not by you."},
+            {"role":"user","content":prompt}
+        ],
+        "reasoning":{"effort":"low"},
+        "text":{"format":{"type":"json_schema","name":"nova_market_assessment","schema":schema,"strict":True}}
+    }
+    r=await client.post(OPENAI_BASE_URL+"/responses",headers={"Authorization":"Bearer "+OPENAI_API_KEY,"Content-Type":"application/json"},json=body,timeout=OPENAI_AI_TIMEOUT_SEC)
+    r.raise_for_status()
+    payload=r.json(); txt=_openai_output_text(payload)
+    data=json.loads(txt)
+    data["model"]=OPENAI_MODEL; data["response_id"]=payload.get("id"); data["updated_at"]=datetime.now(timezone.utc).isoformat()
+    data["symbol"]=snap["symbol"]; data["mint"]=c.get("mint")
+    data["confidence"]=round(clamp(nz(data.get("confidence")),0,100),1)
+    data["long_adjustment"]=round(clamp(nz(data.get("long_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST),2)
+    data["short_adjustment"]=round(clamp(nz(data.get("short_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST),2)
+    return data
+
+
+async def openai_ai_brain_loop():
+    runtime["openai_ai_worker_alive"]=True
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                if not (OPENAI_AI_ENABLED and OPENAI_API_KEY):
+                    runtime["openai_ai_state"]="DISABLED" if not OPENAI_AI_ENABLED else "NO_KEY"
+                    await asyncio.sleep(15); continue
+                rows=[dict(c) for c in (runtime.get("candidates") or []) if c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS]
+                rows.sort(key=lambda c:max(nz(c.get("long_score")),nz(c.get("short_score"))),reverse=True)
+                rows=rows[:OPENAI_AI_TOP_N]
+                if not rows:
+                    runtime["openai_ai_state"]="WAITING_FOR_MARKETS"
+                    await asyncio.sleep(15); continue
+                runtime["openai_ai_inflight"]=True; runtime["openai_ai_state"]="ANALYZING"
+                cache=dict(runtime.get("openai_ai_cache") or {})
+                ok=0
+                for c in rows:
+                    try:
+                        out=await _openai_analyze_major(client,c)
+                        if out:
+                            cache[c.get("mint")]=out;ok+=1
+                    except Exception as e:
+                        runtime["openai_ai_last_error"]=str(e)[:300]
+                        runtime["openai_ai_errors"]=int(runtime.get("openai_ai_errors",0))+1
+                # prune stale analyses
+                cutoff=datetime.now(timezone.utc)-timedelta(seconds=OPENAI_AI_CACHE_SEC*2)
+                for k,v in list(cache.items()):
+                    try:
+                        ts=datetime.fromisoformat(str(v.get("updated_at")))
+                        if ts.tzinfo is None: ts=ts.replace(tzinfo=timezone.utc)
+                        if ts<cutoff: cache.pop(k,None)
+                    except Exception: cache.pop(k,None)
+                runtime["openai_ai_cache"]=cache
+                runtime["openai_ai_last_refresh"]=datetime.now(timezone.utc).isoformat()
+                runtime["openai_ai_calls"]=int(runtime.get("openai_ai_calls",0))+ok
+                runtime["openai_ai_state"]="ACTIVE" if ok else "DEGRADED"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                runtime["openai_ai_last_error"]=str(e)[:300];runtime["openai_ai_state"]="ERROR"
+            finally:
+                runtime["openai_ai_inflight"]=False
+            await asyncio.sleep(OPENAI_AI_REFRESH_SEC)
+
+
+def apply_openai_ai_overlay(pairs):
+    # Bounded confirmation only. No AI call occurs in the trading loop.
+    if not (OPENAI_AI_ENABLED and OPENAI_API_KEY): return pairs
+    cache=runtime.get("openai_ai_cache") or {}; now=datetime.now(timezone.utc)
+    for c in pairs or []:
+        if not (c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS): continue
+        ai=cache.get(c.get("mint"))
+        if not ai: continue
+        try:
+            ts=datetime.fromisoformat(str(ai.get("updated_at"))); ts=ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            if (now-ts).total_seconds()>OPENAI_AI_CACHE_SEC: continue
+        except Exception: continue
+        c["openai_ai"]=ai
+        conf=nz(ai.get("confidence"))
+        if conf<OPENAI_AI_MIN_CONF: continue
+        strength=clamp((conf-OPENAI_AI_MIN_CONF)/max(1,100-OPENAI_AI_MIN_CONF),0.20,1.0)
+        la=clamp(nz(ai.get("long_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST)*strength
+        sa=clamp(nz(ai.get("short_adjustment")),-OPENAI_AI_MAX_ADJUST,OPENAI_AI_MAX_ADJUST)*strength
+        c["long_score"]=round(clamp(nz(c.get("long_score"))+la,0,100),1)
+        c["short_score"]=round(clamp(nz(c.get("short_score"))+sa,0,100),1)
+        edge=nz(c.get("long_score"))-nz(c.get("short_score"))
+        if abs(edge)>=MAJOR_TRADER_MIN_EDGE:
+            c["direction"]="LONG" if edge>0 else "SHORT"; c["direction_edge"]=round(abs(edge),1)
+        c["openai_ai_applied"]=True
+    return pairs
+
+
+def openai_ai_confirmation_gate(c,strategy):
+    # AI may veto only a very high-confidence direct contradiction on majors; it can never bypass other guards.
+    if not (OPENAI_AI_ENABLED and OPENAI_API_KEY and c.get("perp_eligible") and str(c.get("symbol") or "").upper() in MAJOR_ASSETS):
+        return True,"not_applicable"
+    ai=c.get("openai_ai") or {}
+    if nz(ai.get("confidence"))<OPENAI_AI_BLOCK_CONF:return True,"ai_not_strong_enough_to_veto"
+    d=str(ai.get("decision") or "WAIT")
+    if strategy=="PERP_LONG" and d=="SHORT": return False,"OpenAI high-confidence SHORT contradiction"
+    if strategy=="PERP_SHORT" and d=="LONG": return False,"OpenAI high-confidence LONG contradiction"
+    return True,"ai_confirmed_or_wait"
+
+
+def openai_ai_brain_status():
+    cache=list((runtime.get("openai_ai_cache") or {}).values())
+    cache.sort(key=lambda x:nz(x.get("confidence")),reverse=True)
+    return {
+        "enabled":OPENAI_AI_ENABLED,"configured":bool(OPENAI_API_KEY),"model":OPENAI_MODEL,
+        "state":runtime.get("openai_ai_state","STARTING"),"worker_alive":bool(runtime.get("openai_ai_worker_alive")),
+        "inflight":bool(runtime.get("openai_ai_inflight")),"last_refresh":runtime.get("openai_ai_last_refresh"),
+        "calls":runtime.get("openai_ai_calls",0),"errors":runtime.get("openai_ai_errors",0),
+        "last_error":runtime.get("openai_ai_last_error"),"tracked":len(cache),
+        "decision_scope":"MAJOR_PERP_CONFIRMATION_ONLY","meme_hot_path":"NO_LLM_LATENCY",
+        "top":[{"symbol":x.get("symbol"),"decision":x.get("decision"),"confidence":x.get("confidence"),"regime":x.get("regime"),"risk":x.get("risk"),"reasons":x.get("reasons"),"updated_at":x.get("updated_at")} for x in cache[:8]]
+    }
+
+
+def hybrid_brain_status():
+    rows=[]
+    for c in runtime.get("candidates",[]) or []:
+        ctx=c.get("hybrid_ai")
+        if ctx and ctx.get("enabled"):
+            rows.append({"symbol":c.get("symbol"),"source":c.get("data_source"),"bias":ctx.get("bias"),"confidence":ctx.get("confidence"),"long_score":ctx.get("long_score"),"short_score":ctx.get("short_score"),"edge":ctx.get("edge"),"regime":ctx.get("regime")})
+    rows.sort(key=lambda x:(x.get("bias")!="WAIT",nz(x.get("confidence"))),reverse=True)
+    fast=sum(1 for c in runtime.get("candidates",[]) or [] if _is_fast_token_candidate(c))
+    return {"enabled":HYBRID_BRAIN_ENABLED,"mode":"DUAL_BRAIN","meme_fast_enabled":MEME_FAST_ENGINE_ENABLED,"major_trader_enabled":MAJOR_TRADER_ENABLED,"fast_token_candidates":fast,"major_trader_candidates":len(rows),"actionable_majors":sum(1 for x in rows if x.get("bias") in ("LONG","SHORT")),"top_majors":rows[:8],"meme_fast_floors":{"scalp":MEME_FAST_SCALP_FLOOR,"pump":MEME_FAST_PUMP_FLOOR,"min_quality":MEME_FAST_MIN_QUALITY,"min_liquidity":MEME_FAST_MIN_LIQ,"min_buy_pressure":MEME_FAST_MIN_BUY_PRESSURE}}
+
 def _binance_perp_candidate(info,ticker,premium):
     symbol=str(ticker.get("symbol") or "");base_asset=str(info.get("baseAsset") or symbol).upper();price=nz((premium or {}).get("markPrice"),nz(ticker.get("lastPrice")))
     if price<=0:return None
@@ -2659,6 +2953,27 @@ def entry_router_assess(c,strategy=None,signal=None):
     if strategy not in ("SCALP_LONG","PUMP_LONG"):
         result["reason"]=strict_reason or "signal below threshold"
         return result
+
+    # V7.2 fast-token lane: lower score is allowed only with strong real-time context,
+    # reduced position size, and all hard risk/security/portfolio gates still active.
+    if MEME_FAST_ENGINE_ENABLED and _is_fast_token_candidate(c):
+        floor=MEME_FAST_SCALP_FLOOR if strategy=="SCALP_LONG" else MEME_FAST_PUMP_FLOOR
+        liq=nz(c.get("liquidity")); mq=nz(c.get("market_risk")); bp=nz(c.get("buy_pressure"),50); m5=nz(c.get("m5"))
+        if signal>=floor and liq>=MEME_FAST_MIN_LIQ and mq>=MEME_FAST_MIN_QUALITY and bp>=MEME_FAST_MIN_BUY_PRESSURE and -1.8<=m5<=MEME_FAST_MAX_M5:
+            probe=dict(c);probe["_router_soft_pass"]=True
+            # More conservative size for lower-score fast entries.
+            span=max(1.0,threshold-floor);q=clamp((signal-floor)/span,0,1)
+            probe["_fast_risk_multiplier"]=round(MEME_FAST_BASE_RISK+(MEME_FAST_MAX_RISK-MEME_FAST_BASE_RISK)*q,3)
+            okf,reasonf=gate(probe,strategy)
+            if okf:
+                collateral=planned_collateral(probe,strategy)
+                if collateral>=5:
+                    est=execution_cost_estimate(probe,strategy,collateral*max(1.0,min(2.0,strategy_leverage(strategy))))
+                    if nz(est.get("all_in_bps"))<=f("max_execution_cost_bps"):
+                        c["_router_soft_pass"]=True;c["_fast_risk_multiplier"]=probe["_fast_risk_multiplier"]
+                        result.update({"state":"FAST_PASS","reason":"V7.2 fast-token context pass","soft":True,"risk_multiplier":probe["_fast_risk_multiplier"],"liquidity":round(liq,2),"market_quality":round(mq,1),"buy_pressure":round(bp,1),"signal_deficit":round(max(0,threshold-signal),1),"execution_cost_bps":round(nz(est.get("all_in_bps")),1)})
+                        return result
+
     if signal < threshold-deficit:
         result["reason"]="signal too far below controlled range"
         return result
@@ -2733,7 +3048,8 @@ def planned_collateral(c,strategy):
     governor_mult=governor_risk_multiplier(strategy)
     global_loss_mult=global_loss_risk_multiplier()
     router_mult=f("router_soft_risk_multiplier") if c.get("_router_soft_pass") else 1.0
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*global_loss_mult*router_mult
+    fast_mult=nz(c.get("_fast_risk_multiplier"),1.0) if c.get("_fast_risk_multiplier") is not None else 1.0
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*global_loss_mult*router_mult*fast_mult
     effective_stop=max(0.25,strategy_max_loss_pct(strategy))
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
@@ -5654,7 +5970,7 @@ def choose_entry():
     for signal,c,strategy in opportunities:
         quality,route=signal_quality(c,strategy,signal)
         assessment=entry_router_assess(c,strategy,signal)
-        state_rank={"READY":2,"SOFT_PASS":1,"BLOCKED":0}.get(assessment["state"],0)
+        state_rank={"READY":3,"FAST_PASS":2,"SOFT_PASS":1,"BLOCKED":0}.get(assessment["state"],0)
         ranked.append((state_rank,quality,signal,route,c,strategy,assessment))
     ranked.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
 
@@ -5668,6 +5984,11 @@ def choose_entry():
         candle_ok,candle_reason=candle_confirmation_gate(c,strategy)
         if not candle_ok:
             log_decision(c,strategy,"BLOCKED",candle_reason,signal,quality,route.get("quality",0),sec_score)
+            continue
+
+        ai_ok,ai_reason=openai_ai_confirmation_gate(c,strategy)
+        if not ai_ok:
+            log_decision(c,strategy,"BLOCKED",ai_reason,signal,quality,route.get("quality",0),sec_score)
             continue
 
         trade_candidate=dict(c)
@@ -5798,7 +6119,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.2.0"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5876,8 +6197,8 @@ async def candle_intelligence_loop():
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA V7.1.4 Dual Market Brain • V7.0 meme profit core + MTF major-perp overlay",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.4"}) as client:
+    record_event("INFO","ENGINE_START","NOVA V7.2 Hybrid Intelligence • V7.0 meme profit core + MTF major-perp overlay",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.2.0"}) as client:
         addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
@@ -5922,6 +6243,8 @@ async def engine_loop():
                 # V7.1.1: Candle OHLCV refresh is handled by an independent background worker.
                 # The main trading loop only consumes the latest cache, so slow Binance candles cannot stall NOVA.
                 apply_candle_overlay(pairs)
+                apply_hybrid_intelligence(pairs)
+                apply_openai_ai_overlay(pairs)
                 pairs.sort(key=lambda x:max(nz(x.get("pump_score")),nz(x.get("scalp_score")),nz(x.get("long_score")),nz(x.get("short_score"))),reverse=True)
 
                 if pairs:
@@ -5976,6 +6299,7 @@ async def startup():
         runtime["daily_target_lock_time"]=None
     asyncio.create_task(engine_loop())
     asyncio.create_task(candle_intelligence_loop())
+    asyncio.create_task(openai_ai_brain_loop())
     asyncio.create_task(position_watch_loop())
     asyncio.create_task(sniper_scan_loop())
     asyncio.create_task(pumpportal_realtime_loop())
@@ -6204,7 +6528,9 @@ def health():
     return {
         "ok":True,
         "version":APP_VERSION,
-        "profit_core_version":PROFIT_CORE_VERSION,
+        "profit_core_version":PROFIT_CORE_VERSION,"hybrid_brain_enabled":HYBRID_BRAIN_ENABLED,
+        "openai_ai_enabled":OPENAI_AI_ENABLED,"openai_ai_configured":bool(OPENAI_API_KEY),"openai_ai_model":OPENAI_MODEL,
+        "openai_ai_state":runtime.get("openai_ai_state"),
         "profit_core_locked":True,
         "candle_decision_impact":CANDLE_DECISION_IMPACT,
         "free_lite":FREE_LITE,
@@ -6255,6 +6581,11 @@ def api_candle_intelligence(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-
     auth(x_nova_key)
     return {"version":APP_VERSION,"live_execution_locked":LIVE_EXECUTION_LOCKED,"candle_intelligence":candle_intelligence_status()}
 
+@app.get("/api/ai-analysis")
+def api_ai_analysis(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
+    auth(x_nova_key)
+    return {"version":APP_VERSION,"live_execution_locked":LIVE_EXECUTION_LOCKED,"openai_ai_brain":openai_ai_brain_status()}
+
 @app.get("/api/dashboard")
 def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
     auth(x_nova_key)
@@ -6275,6 +6606,8 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "universe":universe_status(),
         "candle_intelligence":candle_intelligence_status(),
+        "hybrid_brain":hybrid_brain_status(),
+        "openai_ai_brain":openai_ai_brain_status(),
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
         "engine_controls":engine_controls_status(),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,
@@ -6300,6 +6633,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
             "states":{
                 "READY":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="READY"),
                 "SOFT_PASS":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="SOFT_PASS"),
+                "FAST_PASS":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="FAST_PASS"),
                 "BLOCKED":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="BLOCKED")
             }
         },

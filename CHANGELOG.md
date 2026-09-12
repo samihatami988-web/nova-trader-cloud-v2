@@ -1,10 +1,11 @@
-# V7.1.3 Profit Core Restore
+# Changelog
 
-- Restored V7.0.0 signal thresholds exactly.
-- Restored V7.0.0 Launch score gate exactly.
-- Restored V7.0.0 Launch profit-cycle sizing floor.
-- Removed Candle score overlay from trading decisions.
-- Disabled Candle hard gate permanently for this release; Candle Brain is monitor-only.
-- Global Loss Guard now affects only risk sizing and circuit-breaker cooldowns; it does not alter signal thresholds/scores.
-- Retained V7.1.1 single-flight dashboard polling and Candle worker isolation.
-- Added explicit health/dashboard proof: V7.0 profit core locked.
+## 7.2.1 — OpenAI AI Brain
+- Added real OpenAI Responses API integration for major perpetual markets.
+- Added strict structured JSON assessment: LONG/SHORT/WAIT, confidence, regime, risk, bounded score adjustments, reasons.
+- Added asynchronous AI worker and cache so LLM latency never blocks the trading loop.
+- Meme/launch hot path remains LLM-free and event-driven.
+- Added high-confidence contradiction veto for major perps only.
+- Added `/api/ai-analysis` and dashboard OpenAI AI Brain telemetry.
+- API key remains server-side only.
+- Risk guards and LIVE execution hard-lock remain authoritative.
