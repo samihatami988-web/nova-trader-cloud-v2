@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.1.1"
+APP_VERSION = "7.1.2"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -60,6 +60,24 @@ CANDLE_HTTP_TIMEOUT_SEC = max(3.0, min(12.0, float(os.getenv("NOVA_CANDLE_HTTP_T
 CANDLE_HTTP_RETRIES = max(0, min(2, int(float(os.getenv("NOVA_CANDLE_HTTP_RETRIES", "1")))))
 CANDLE_WORKER_TICK_SEC = max(3.0, min(15.0, float(os.getenv("NOVA_CANDLE_WORKER_TICK_SEC", "8"))))
 CANDLE_EFFECTIVE_CONCURRENCY = min(CANDLE_CONCURRENCY, 4 if FREE_LITE else CANDLE_CONCURRENCY)
+
+# V7.1.2 Global Loss Guard + Adaptive Recovery.
+# This sits above individual strategy governors: after the first global loss it de-risks and tightens entries;
+# after repeated losses it enforces a persisted cooldown derived from Trade history.
+GLOBAL_LOSS_GUARD_ENABLED = os.getenv("NOVA_GLOBAL_LOSS_GUARD_ENABLED", "true").lower() in ("1","true","yes","on")
+GLOBAL_LOSS_LOOKBACK = max(4, min(30, int(float(os.getenv("NOVA_GLOBAL_LOSS_LOOKBACK", "12")))))
+GLOBAL_LOSS_CAUTION_RISK = max(0.10, min(0.80, float(os.getenv("NOVA_GLOBAL_LOSS_CAUTION_RISK", "0.50"))))
+GLOBAL_LOSS_CAUTION_THRESHOLD_ADD = max(0.0, min(10.0, float(os.getenv("NOVA_GLOBAL_LOSS_CAUTION_THRESHOLD_ADD", "3"))))
+GLOBAL_LOSS_COOLDOWN_COUNT = max(2, min(4, int(float(os.getenv("NOVA_GLOBAL_LOSS_COOLDOWN_COUNT", "2")))))
+GLOBAL_LOSS_COOLDOWN_MIN = max(5, min(180, int(float(os.getenv("NOVA_GLOBAL_LOSS_COOLDOWN_MIN", "30")))))
+GLOBAL_LOSS_SAFE_COUNT = max(GLOBAL_LOSS_COOLDOWN_COUNT + 1, min(6, int(float(os.getenv("NOVA_GLOBAL_LOSS_SAFE_COUNT", "3")))))
+GLOBAL_LOSS_SAFE_COOLDOWN_MIN = max(GLOBAL_LOSS_COOLDOWN_MIN, min(360, int(float(os.getenv("NOVA_GLOBAL_LOSS_SAFE_COOLDOWN_MIN", "90")))))
+GLOBAL_LOSS_PROBE_RISK = max(0.10, min(0.50, float(os.getenv("NOVA_GLOBAL_LOSS_PROBE_RISK", "0.25"))))
+GLOBAL_LOSS_PROBE_THRESHOLD_ADD = max(GLOBAL_LOSS_CAUTION_THRESHOLD_ADD, min(12.0, float(os.getenv("NOVA_GLOBAL_LOSS_PROBE_THRESHOLD_ADD", "5"))))
+GLOBAL_LOSS_RECOVERY_RISK = max(GLOBAL_LOSS_PROBE_RISK, min(0.90, float(os.getenv("NOVA_GLOBAL_LOSS_RECOVERY_RISK", "0.65"))))
+GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD = max(0.0, min(GLOBAL_LOSS_PROBE_THRESHOLD_ADD, float(os.getenv("NOVA_GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD", "2"))))
+GLOBAL_LOSS_LAUNCH_SCORE_ADD = max(0.0, min(12.0, float(os.getenv("NOVA_GLOBAL_LOSS_LAUNCH_SCORE_ADD", "2"))))
+GLOBAL_LOSS_STATUS_CACHE = {"ts":0.0,"value":None}
 
 PUMPPORTAL_API_KEY_RAW = os.getenv("PUMPPORTAL_API_KEY","")
 PUMPPORTAL_API_KEY = PUMPPORTAL_API_KEY_RAW.strip()
@@ -2697,8 +2715,9 @@ def planned_collateral(c,strategy):
     strategy_risk_mult=f("sniper_risk_multiplier") if strategy=="SNIPER_LONG" else 1.0
     target_mult=daily_target_risk_multiplier()
     governor_mult=governor_risk_multiplier(strategy)
+    global_loss_mult=global_loss_risk_multiplier()
     router_mult=f("router_soft_risk_multiplier") if c.get("_router_soft_pass") else 1.0
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*router_mult
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*global_loss_mult*router_mult
     effective_stop=max(0.25,strategy_max_loss_pct(strategy))
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
@@ -3002,11 +3021,14 @@ def optimizer_report(strategy):
 
 def effective_threshold(strategy,c=None):
     base=base_threshold(strategy)
-    if not b("adaptive_enabled"):return base
-    rep=optimizer_report(strategy)
-    th=rep.get("effective_threshold",base)
+    th=base
+    if b("adaptive_enabled"):
+        rep=optimizer_report(strategy)
+        th=rep.get("effective_threshold",base)
     # Regime-aware tightening. Never loosen because of volatility.
     if c and c.get("volatility_regime")=="HIGH":th+=2
+    # V7.1.2: cross-strategy loss state tightens the next entry after even one loss.
+    th+=global_loss_threshold_add()
     return min(95,th)
 
 def strategy_health(strategy):
@@ -3052,6 +3074,99 @@ def adaptive_status():
         "optimizers":{s:optimizer_report(s) for s in strategies}
     }
 
+
+def _aware_utc(dt):
+    if dt is None:return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+def global_loss_guard_status(force=False):
+    """Cross-strategy circuit breaker derived from persisted Trade rows.
+
+    Unlike runtime pause_until, this survives a redeploy because the cooldown age is
+    reconstructed from the latest closed trade. A tiny cache avoids a DB query for
+    every candidate score while preserving near-immediate reaction to a closed trade.
+    """
+    now_ts=time.time()
+    cached=GLOBAL_LOSS_STATUS_CACHE.get("value")
+    if not force and cached is not None and now_ts-nz(GLOBAL_LOSS_STATUS_CACHE.get("ts"))<1.0:
+        return dict(cached)
+
+    def finish(value):
+        GLOBAL_LOSS_STATUS_CACHE.update({"ts":now_ts,"value":dict(value)})
+        return dict(value)
+
+    base={
+        "enabled":GLOBAL_LOSS_GUARD_ENABLED,"state":"DISABLED" if not GLOBAL_LOSS_GUARD_ENABLED else "NORMAL",
+        "blocked":False,"loss_streak":0,"risk_multiplier":1.0,"threshold_add":0.0,
+        "cooldown_remaining_sec":0,"latest_trade":None,"probe":False,"message":"normal"
+    }
+    if not GLOBAL_LOSS_GUARD_ENABLED:
+        return finish(base)
+    with SessionLocal() as db:
+        rows=db.scalars(select(Trade).order_by(Trade.id.desc()).limit(GLOBAL_LOSS_LOOKBACK)).all()
+    if not rows:
+        return finish(base)
+
+    streak=0
+    for tr in rows:
+        if nz(tr.pnl)<0:streak+=1
+        else:break
+    latest=rows[0]
+    closed=_aware_utc(latest.closed_at)
+    age_sec=max(0.0,(datetime.now(timezone.utc)-closed).total_seconds()) if closed else 10**9
+    base.update({
+        "loss_streak":streak,
+        "latest_trade":{"symbol":latest.symbol,"strategy":latest.strategy,"pnl":round(nz(latest.pnl),4),
+                        "pnl_pct":round(nz(latest.pnl_pct),3),"closed_at":closed.isoformat() if closed else None}
+    })
+
+    # A win immediately after a loss is not an instant return to full aggression.
+    if streak==0:
+        if len(rows)>=2 and nz(rows[0].pnl)>0 and nz(rows[1].pnl)<0:
+            base.update({"state":"RECOVERING","risk_multiplier":GLOBAL_LOSS_RECOVERY_RISK,
+                         "threshold_add":GLOBAL_LOSS_RECOVERY_THRESHOLD_ADD,
+                         "message":"win after loss; staged recovery"})
+        return finish(base)
+
+    if streak==1:
+        base.update({"state":"CAUTION","risk_multiplier":GLOBAL_LOSS_CAUTION_RISK,
+                     "threshold_add":GLOBAL_LOSS_CAUTION_THRESHOLD_ADD,
+                     "message":"first loss; de-risk and tighten next entry"})
+        return finish(base)
+
+    safe=streak>=GLOBAL_LOSS_SAFE_COUNT
+    cooldown_min=GLOBAL_LOSS_SAFE_COOLDOWN_MIN if safe else GLOBAL_LOSS_COOLDOWN_MIN
+    remaining=max(0.0,cooldown_min*60-age_sec)
+    if remaining>0:
+        base.update({"state":"SAFE_MODE" if safe else "COOLDOWN","blocked":True,"risk_multiplier":0.0,
+                     "threshold_add":GLOBAL_LOSS_PROBE_THRESHOLD_ADD,
+                     "cooldown_remaining_sec":round(remaining,1),
+                     "message":f"{streak} consecutive global losses; cooldown active"})
+        return finish(base)
+
+    # Once the cooldown expires, allow exactly one reduced-size recovery probe at a time.
+    base.update({"state":"RECOVERY_PROBE","risk_multiplier":GLOBAL_LOSS_PROBE_RISK,
+                 "threshold_add":GLOBAL_LOSS_PROBE_THRESHOLD_ADD,"probe":True,
+                 "message":"cooldown complete; one reduced-size probe allowed"})
+    return finish(base)
+
+def global_loss_guard_gate():
+    st=global_loss_guard_status()
+    if st.get("blocked"):
+        return False,"global loss cooldown"
+    if st.get("probe"):
+        with SessionLocal() as s:
+            if s.scalar(select(Position).limit(1)) is not None:
+                return False,"global recovery probe already active"
+    return True,"ok"
+
+def global_loss_risk_multiplier():
+    if not GLOBAL_LOSS_GUARD_ENABLED:return 1.0
+    return max(0.0,min(1.0,nz(global_loss_guard_status().get("risk_multiplier"),1.0)))
+
+def global_loss_threshold_add():
+    if not GLOBAL_LOSS_GUARD_ENABLED:return 0.0
+    return max(0.0,nz(global_loss_guard_status().get("threshold_add"),0.0))
 
 def strategy_recent_trade_stats(strategy,limit=None):
     limit=limit or i("governor_recent_trades")
@@ -3149,6 +3264,9 @@ def gate(c,strategy=None):
         return False,"shadow requires execution simulator"
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:
         return False,"loss pause"
+    gl_ok,gl_reason=global_loss_guard_gate()
+    if not gl_ok:
+        return False,gl_reason
 
     if strategy:
         spu=runtime["strategy_pauses"].get(strategy)
@@ -3437,6 +3555,8 @@ def close_position(p,c,reason):
     runtime["realtime_exit_last_eval"].pop(p.mint+":rest",None)
     record_event("INFO","POSITION_CLOSED",f"{p.symbol} {p.strategy} closed: {reason}",
                  {"pnl":round(total,4),"pnl_pct":round(pnl_pct,3),"funding_pnl":round(funding_pnl,4)})
+    GLOBAL_LOSS_STATUS_CACHE["ts"]=0.0
+    GLOBAL_LOSS_STATUS_CACHE["value"]=None
     maybe_pause_strategy(p.strategy)
     recovery_limit=min(i("max_consecutive_losses"),i("governor_loss_streak_limit"))
     if consecutive_losses()>=recovery_limit:
@@ -4050,6 +4170,9 @@ def launch_gate(m):
     if b("killed") or not b("bot_enabled"):return False,"bot stopped"
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:
         return False,"loss pause"
+    gl_ok,gl_reason=global_loss_guard_gate()
+    if not gl_ok:
+        return False,gl_reason
 
     gok,greason=strategy_governor_gate("LAUNCH_SNIPER")
     if not gok:return False,greason
@@ -4084,7 +4207,10 @@ def launch_gate(m):
     if nz(m.get("buy_sol_2s"))<(min(f("launch_min_buy_sol_2s"),PROFIT_LAUNCH_MIN_BUY_SOL) if profit_cycle_active() else f("launch_min_buy_sol_2s")):return False,"launch low buy flow"
     if nz(m.get("top_buyer_share_pct"),100)>f("launch_max_top_buyer_share_pct"):
         return False,"launch buyer concentration"
-    if nz(m.get("score"))<(min(f("launch_min_score"),PROFIT_LAUNCH_MIN_SCORE) if profit_cycle_active() else f("launch_min_score")):return False,"launch low score"
+    launch_score_floor=(min(f("launch_min_score"),PROFIT_LAUNCH_MIN_SCORE) if profit_cycle_active() else f("launch_min_score"))
+    launch_score_floor=min(95.0,launch_score_floor+global_loss_threshold_add()+
+                           (GLOBAL_LOSS_LAUNCH_SCORE_ADD if global_loss_guard_status().get("state") in ("CAUTION","RECOVERY_PROBE","RECOVERING") else 0.0))
+    if nz(m.get("score"))<launch_score_floor:return False,"launch low score"
     if not nz(m.get("current_mcap")) or not m.get("mcap_kind"):
         return False,"launch no price reference"
 
@@ -4167,11 +4293,12 @@ def launch_position_size(m):
     eq=max(0,nz(metrics().get("equity")))
     if profit_cycle_active():
         cap=eq*1.00/100
-        gov=max(governor_risk_multiplier("LAUNCH_SNIPER"),0.50)
+        # V7.1.2: respect probation and global-loss de-risking; do not force a 0.50 floor.
+        gov=max(governor_risk_multiplier("LAUNCH_SNIPER"),0.25)
     else:
         cap=eq*f("launch_max_position_pct")/100
         gov=governor_risk_multiplier("LAUNCH_SNIPER")
-    amount=min(cap*gov,f("cash"))
+    amount=min(cap*gov*global_loss_risk_multiplier(),f("cash"))
     return max(0,amount)
 
 def open_launch_position(m):
@@ -6165,6 +6292,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
             "strategies":{s:strategy_governor_status(s) for s in
                 ["LAUNCH_SNIPER","SNIPER_LONG","SCALP_LONG","PUMP_LONG","PERP_LONG","PERP_SHORT"]}
         },
+        "global_loss_guard":global_loss_guard_status(),
         "survival_guard":survival_guard_status(),
         "realtime_exit":{
             "enabled":b("realtime_exit_enabled"),

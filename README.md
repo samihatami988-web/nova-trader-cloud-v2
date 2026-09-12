@@ -1,20 +1,37 @@
-# NOVA Trader V7.1.1 — Connection Stability Hotfix
+# NOVA Trader V7.1.2 — Global Loss Guard + Adaptive Recovery
 
-V7.1.1 is a stability-only release built on the V7.1 Multi-Timeframe Candle Brain. It preserves the trading logic and current PAPER/SHADOW data while fixing dashboard connection flicker and isolating candle-provider latency from the core trading loop.
+V7.1.2 is a defensive hotfix built on V7.1.1. It does **not** replace the existing strategy, Candle Brain, Micro Profit Cycle, Capital Shield, Edge Governor, or connection-stability work.
 
-## What changed
+## New protection layer
 
-- Single-flight dashboard polling; no overlapping `load()` requests.
-- Recursive polling instead of fixed `setInterval` overlap.
-- 30-second health cache to reduce API traffic.
-- 20-second connection grace window and 3-failure threshold before hard `DISCONNECTED`.
-- Transient failures render `RETRYING` while keeping the last good dashboard data visible.
-- Authentication/configuration failures still fail immediately.
-- Candle OHLCV refresh moved to `candle_intelligence_loop()` background worker.
-- Core `engine_loop()` only consumes the latest candle cache and no longer waits for Binance klines.
-- Bounded candle HTTP timeout/retry and lower FREE_LITE concurrency.
-- Candle worker health fields exposed in `/health` and candle intelligence status.
+The new Global Loss Guard watches **closed trades across all strategies together**.
 
-## Deployment
+- `NORMAL`: no recent consecutive global loss restriction.
+- `CAUTION`: after the first closed loss, next entries use 50% global risk and require +3 signal points.
+- `COOLDOWN`: after 2 consecutive global losses, new entries are blocked for 30 minutes.
+- `SAFE_MODE`: after 3+ consecutive global losses, new entries are blocked for 90 minutes.
+- `RECOVERY_PROBE`: after cooldown expires, only one reduced-size probe position is allowed, at 25% global risk and +5 threshold points.
+- `RECOVERING`: after a recovery win, risk returns gradually at 65% rather than jumping straight back to full size.
 
-Replace `app.py` on Northflank and `index.html` on GitHub Pages. Keep the existing database and environment variables. Do not reset the PAPER test.
+The state is reconstructed from persisted `Trade` rows, so the protection survives a Northflank redeploy/restart.
+
+## Launch Sniper change
+
+Launch Sniper now respects the global loss-risk multiplier and no longer forces the previous 0.50 governor floor while in profit-cycle mode. During CAUTION/RECOVERY states its launch score requirement is also tightened.
+
+## Dashboard
+
+A new **Global Loss Guard** card shows:
+
+- Loss streak
+- Risk multiplier
+- Threshold tightening
+- Cooldown remaining
+- NORMAL / CAUTION / COOLDOWN / SAFE_MODE / RECOVERY_PROBE / RECOVERING
+
+## Important
+
+- PAPER / SHADOW only; LIVE execution remains hard-locked.
+- Do not change `DATABASE_URL` if you want to keep existing PAPER history.
+- Do not press `RESET PAPER TEST` before comparing the run.
+- This reduces exposure after losses; it cannot make losses impossible.
