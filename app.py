@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "7.1.3"
+APP_VERSION = "7.1.4"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -45,7 +45,7 @@ MEME_ASSETS = {"DOGE","SHIB","PEPE","BONK","WIF","FLOKI","BOME","BRETT","MOG","T
 # PumpPortal realtime logic or the existing liquidity/security/risk gates.
 CANDLE_ENGINE_ENABLED = os.getenv("NOVA_CANDLE_ENGINE_ENABLED", "true").lower() in ("1","true","yes","on")
 # V7.1.3 Profit Core Restore: candles are observability only and can never alter V7.0 scores/gates.
-CANDLE_DECISION_IMPACT = False
+CANDLE_DECISION_IMPACT = True  # V7.1.4: majors/perps only; meme/launch V7 flow stays independent
 PROFIT_CORE_VERSION = "7.0.0"
 CANDLE_REFRESH_SEC = max(30, min(300, int(float(os.getenv("NOVA_CANDLE_REFRESH_SEC", "60")))))
 CANDLE_SCAN_CAP = max(3, min(24, int(float(os.getenv("NOVA_CANDLE_SCAN_CAP", "10")))))
@@ -490,14 +490,14 @@ DEFAULTS = {
     "launch_max_positions": "1",
     "launch_max_position_pct": "0.50",
     "launch_max_entries_per_hour": "4",
-    "launch_raw_stop_pct": "1.00",
-    "launch_max_net_loss_pct": "7.00",
-    "launch_scratch_after_sec": "3.0",
+    "launch_raw_stop_pct": "0.75",
+    "launch_max_net_loss_pct": "3.00",
+    "launch_scratch_after_sec": "1.25",
     "launch_scratch_peak_pct": "1.0",
-    "launch_scratch_loss_pct": "4.5",
+    "launch_scratch_loss_pct": "1.75",
     "launch_max_hold_sec": "22",
-    "launch_flow_reversal_after_sec": "1.0",
-    "launch_flow_reversal_pressure": "44",
+    "launch_flow_reversal_after_sec": "0.60",
+    "launch_flow_reversal_pressure": "47",
     "launch_protocol_fee_bps": "125",
     "launch_interface_fee_bps": "50",
     "launch_slippage_floor_bps": "35",
@@ -1720,7 +1720,10 @@ async def refresh_candle_intelligence(client,pairs,force=False):
             runtime["candle_refresh_duration_ms"]=round((time.monotonic()-started)*1000,1)
 
 def apply_candle_overlay(pairs):
-    """Attach Candle Brain telemetry without changing any V7.0 trading score or direction."""
+    """V7.1.4 Dual Market Brain.
+    Meme/launch candidates keep the V7.0 flow/event scores. Major PERP candidates may use
+    MTF candle structure as a bounded confirmation overlay for LONG/SHORT direction.
+    """
     if not CANDLE_ENGINE_ENABLED:return pairs
     cache=runtime.get("candle_intelligence") or {}
     for c in pairs or []:
@@ -1729,11 +1732,37 @@ def apply_candle_overlay(pairs):
         c["candle_intelligence"]=intel
         c["candle_long_score"]=intel.get("long_score")
         c["candle_short_score"]=intel.get("short_score")
+        symbol=str(c.get("symbol") or "").upper()
+        if CANDLE_DECISION_IMPACT and c.get("perp_eligible") and symbol in MAJOR_ASSETS:
+            w=CANDLE_OVERLAY_WEIGHT
+            raw_long=nz(c.get("long_score")); raw_short=nz(c.get("short_score"))
+            cl=nz(intel.get("long_score"),50); cs=nz(intel.get("short_score"),50)
+            conf=nz(intel.get("confidence"),50)
+            # Confidence scales the overlay down when candle agreement is weak.
+            ew=w*clamp((conf-45)/40,0.25,1.0)
+            c["long_score"]=round(clamp(raw_long*(1-ew)+cl*ew,0,100),1)
+            c["short_score"]=round(clamp(raw_short*(1-ew)+cs*ew,0,100),1)
+            edge=c["long_score"]-c["short_score"]
+            if abs(edge)>=4:
+                c["direction"]="LONG" if edge>0 else "SHORT"
+            c["candle_decision_applied"]=True
     return pairs
 
 def candle_confirmation_gate(c,strategy):
-    # V7.1.3: monitoring only. Candle analysis is never an entry/exit gate.
-    return True,"monitor_only"
+    # Only major perpetuals receive a candle contradiction guard. Meme/launch remains event-driven.
+    if not (CANDLE_ENGINE_ENABLED and CANDLE_DECISION_IMPACT and c.get("perp_eligible")):
+        return True,"not_applicable"
+    if str(c.get("symbol") or "").upper() not in MAJOR_ASSETS:
+        return True,"non_major"
+    intel=c.get("candle_intelligence") or {}
+    if not intel:return True,"no_candle_data"
+    conf=nz(intel.get("confidence")); ls=nz(intel.get("long_score")); ss=nz(intel.get("short_score"))
+    if conf < CANDLE_GATE_MIN_CONFIDENCE:return True,"low_candle_confidence"
+    if strategy=="PERP_LONG" and ss>=CANDLE_GATE_OPPOSITE_SCORE and ss-ls>=CANDLE_GATE_MIN_EDGE:
+        return False,"strong MTF bearish contradiction"
+    if strategy=="PERP_SHORT" and ls>=CANDLE_GATE_OPPOSITE_SCORE and ls-ss>=CANDLE_GATE_MIN_EDGE:
+        return False,"strong MTF bullish contradiction"
+    return True,"mtf_confirmed"
 
 def candle_intelligence_status():
     cache=list((runtime.get("candle_intelligence") or {}).values())
@@ -1746,7 +1775,7 @@ def candle_intelligence_status():
                 "bias":x.get("bias"),"long_score":x.get("long_score"),"short_score":x.get("short_score"),"confidence":x.get("confidence"),
                 "agreement":x.get("agreement"),"structure":x.get("structure"),"rsi14":x.get("rsi14"),"atr_pct":x.get("atr_pct"),
                 "m15_rsi":t15.get("rsi14"),"h1_structure":t1.get("structure"),"h1_pattern":t1.get("pattern")}
-    return {"enabled":CANDLE_ENGINE_ENABLED,"mode":"MONITOR_ONLY","decision_impact":False,"hard_gate":False,"requested_hard_gate":CANDLE_HARD_GATE_REQUESTED,"tracked":len(cache),"majors":majors,
+    return {"enabled":CANDLE_ENGINE_ENABLED,"mode":"MAJOR_PERP_OVERLAY","decision_impact":CANDLE_DECISION_IMPACT,"hard_gate":True,"requested_hard_gate":CANDLE_HARD_GATE_REQUESTED,"tracked":len(cache),"majors":majors,
             "bullish":bullish,"bearish":bearish,"neutral":neutral,"timeframes":list(CANDLE_TIMEFRAMES),
             "last_refresh":runtime.get("candle_last_refresh"),"refresh_count":runtime.get("candle_refresh_count",0),
             "errors":len(runtime.get("candle_errors") or {}),"worker_alive":bool(runtime.get("candle_worker_alive")),
@@ -3803,6 +3832,8 @@ def manage_positions():
                 reason="LAUNCH_CREATOR_SELL"
             elif obj.strategy=="LAUNCH_SNIPER" and nz(c.get("launch_raw_move_pct"))<=-f("launch_raw_stop_pct"):
                 reason="LAUNCH_RAW_STOP"
+            elif obj.strategy=="LAUNCH_SNIPER" and net_ret<=-min(3.0,f("launch_max_net_loss_pct")):
+                reason="LAUNCH_FAST_RISK_EXIT"
             elif obj.strategy=="LAUNCH_SNIPER" and held_seconds>=f("launch_scratch_after_sec") and \
                  peak_net_ret<f("launch_scratch_peak_pct") and net_ret<=-f("launch_scratch_loss_pct"):
                 reason="LAUNCH_SCRATCH_EXIT"
@@ -5634,6 +5665,11 @@ def choose_entry():
             log_decision(c,strategy,"BLOCKED",assessment["reason"],signal,quality,route.get("quality",0),sec_score)
             continue
 
+        candle_ok,candle_reason=candle_confirmation_gate(c,strategy)
+        if not candle_ok:
+            log_decision(c,strategy,"BLOCKED",candle_reason,signal,quality,route.get("quality",0),sec_score)
+            continue
+
         trade_candidate=dict(c)
         if assessment["state"]=="SOFT_PASS":
             trade_candidate["_router_soft_pass"]=True
@@ -5762,7 +5798,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/7.1.4"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -5840,8 +5876,8 @@ async def candle_intelligence_loop():
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    record_event("INFO","ENGINE_START","NOVA V7.1.3 universal engine • V7.0 profit core locked • candle monitor-only",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.3"}) as client:
+    record_event("INFO","ENGINE_START","NOVA V7.1.4 Dual Market Brain • V7.0 meme profit core + MTF major-perp overlay",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Universal/7.1.4"}) as client:
         addresses=[];boosts={};universal_assets=[];universal_boosts={};last_discovery=0;last_universe=0
         while True:
             try:
@@ -6170,7 +6206,7 @@ def health():
         "version":APP_VERSION,
         "profit_core_version":PROFIT_CORE_VERSION,
         "profit_core_locked":True,
-        "candle_decision_impact":False,
+        "candle_decision_impact":CANDLE_DECISION_IMPACT,
         "free_lite":FREE_LITE,
         "process":"UP",
         "loop_alive":bool(runtime.get("loop_alive")),
@@ -6226,7 +6262,7 @@ def dashboard(x_nova_key:Optional[str]=Header(None, alias="X-NOVA-Key")):
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
     return {
         "version":APP_VERSION,
-        "profit_core":{"version":PROFIT_CORE_VERSION,"locked":True,"candle_decision_impact":False,"global_loss_scope":"risk_cooldown_only"},
+        "profit_core":{"version":PROFIT_CORE_VERSION,"locked":True,"candle_decision_impact":CANDLE_DECISION_IMPACT,"global_loss_scope":"risk_cooldown_only"},
         "free_lite":{
             "enabled":FREE_LITE,
             "pulse_subscriptions":len(runtime.get("pulse_subscribed",set())),
